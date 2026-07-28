@@ -558,3 +558,44 @@ omitted above, as in the first run; it has no bearing on these results.)
    and logged rather than trusted — but this is a defense-in-depth measure,
    not a new primary guard; the ramp/effective-bounds checks downstream were
    already safe against a bad "current" value even before this change.
+
+## 2026-07-28 — independent adversarial verification (orchestrator)
+
+Verified the range-enforcement pass myself rather than taking the agent's report on trust.
+
+Full suite: `python3 -m pytest tests/ -q` → **177 passed**.
+
+Probes run directly against `--sim` (all refused, `stall_ms == 0.0` on every joint afterwards):
+
+| Attack | Result |
+|---|---|
+| `set_position("GRIP", 700)` — the exact incident value | `CalibrationRequired` |
+| `GRIP 1499` (one below the floor) | `CalibrationRequired` |
+| `GRIP 2600` (above electrical) | `CalibrationRequired` |
+| batch `{"GRIP":1950,"ELBOW":9999}` | `CalibrationRequired`, zero partial motion |
+| `duration_ms=-5` | `InvalidPosition` |
+| unknown joint `"NOPE"` | `InvalidPosition` |
+| `"1950"` as a string | `PositionOutOfRange` |
+| `move_servos(..., token=None)` | `SafetyBypassError` |
+| hand-forged `MotionToken(transport)` | `SafetyBypassError` |
+| replay of a spent token | `SafetyBypassError` |
+| legitimately minted token + `GRIP 700 / 1499 / 2600 / 499` | `IllegalServoTarget` (layer-9 backstop confirmed live) |
+| `--override-reason` + `GRIP 700 / 1400 / 1499` | rejected — override cannot reach the incident value |
+| `--override-reason` + `GRIP 2400` | rejected (outside configured `[1600, 2300]`) |
+| `--override-reason` + `GRIP 1600` | accepted, logged as WARNING — override works as designed |
+
+CLI exit codes: illegal → `2`, legal → `0`.
+
+### Defect found and fixed during this verification
+
+`Arm.set_positions` speaks dicts, but both transports documented `Sequence[tuple]`. Passing
+a dict made `assert_targets_within_electrical_range` raise a bare
+`TypeError: cannot unpack non-iterable int object` from inside the packet-building loop
+instead of a clear `IllegalServoTarget`. It failed *closed* (no bytes written, no motion),
+so this was not a safety hole — but the error was misleading, and a one-shot generator
+would have been consumed by the range check and then written out as a short packet.
+
+Fixed with `protocol.normalize_targets()`, called by both transports before the range
+assert. Accepts a `Mapping` or a sequence of 2-tuples; everything else (bare ints, strings,
+generators, wrong arity, non-iterables) raises `IllegalServoTarget`. Regression coverage in
+`tests/test_target_normalization.py` (13 tests).

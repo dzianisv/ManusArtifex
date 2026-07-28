@@ -34,6 +34,7 @@ from .protocol import (
     MotionToken,
     NoResponse,
     assert_targets_within_electrical_range,
+    normalize_targets,
     require_motion_token,
 )
 
@@ -173,15 +174,16 @@ class SimTransport:
         token: Optional[MotionToken] = None,
     ) -> None:
         require_motion_token(self, token)
-        assert_targets_within_electrical_range(id_positions, duration_ms)
+        targets = normalize_targets(id_positions)
+        assert_targets_within_electrical_range(targets, duration_ms)
         entry = {
             "cmd": "MOVE",
-            "targets": list(id_positions),
+            "targets": list(targets),
             "duration_ms": duration_ms,
             "ts": time.monotonic(),
             "achieved": {},
         }
-        for servo_id, target in id_positions:
+        for servo_id, target in targets:
             joint = self.joints.get(servo_id)
             if joint is None:
                 raise KeyError(f"sim has no joint for servo id {servo_id}")

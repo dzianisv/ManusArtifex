@@ -41,7 +41,8 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from collections.abc import Mapping, Sequence
+from typing import List, Optional
 
 import hid
 
@@ -139,6 +140,33 @@ class IllegalServoTarget(config.InvalidPosition):
     """
 
 
+def normalize_targets(id_positions) -> list:
+    """Coerce the accepted target forms into a concrete ``[(servo_id, position), ...]``.
+
+    ``Arm.set_positions`` speaks dicts while the transports document a sequence of
+    pairs. Rather than let that mismatch surface as an obscure ``TypeError`` from
+    the middle of a packet-building loop (or, worse, let a one-shot generator be
+    consumed by the range check and then written out empty), normalise here and
+    raise ``IllegalServoTarget`` for anything else. Fail closed, and say why.
+    """
+    if isinstance(id_positions, Mapping):
+        return list(id_positions.items())
+    if isinstance(id_positions, (str, bytes)) or not isinstance(id_positions, Sequence):
+        raise IllegalServoTarget(
+            f"refusing to send SERVO_MOVE: targets must be a mapping or a sequence of "
+            f"(servo_id, position) pairs, got {type(id_positions).__name__}."
+        )
+    pairs = []
+    for item in id_positions:
+        if isinstance(item, (str, bytes)) or not isinstance(item, Sequence) or len(item) != 2:
+            raise IllegalServoTarget(
+                f"refusing to send SERVO_MOVE: each target must be a (servo_id, position) "
+                f"pair, got {item!r}."
+            )
+        pairs.append((item[0], item[1]))
+    return pairs
+
+
 def assert_targets_within_electrical_range(id_positions: Sequence[tuple], duration_ms: Optional[int] = None) -> None:
     """Raise ``IllegalServoTarget`` unless every ``(servo_id, position)`` pair is a
     real integer inside that servo's own electrical range, and ``duration_ms`` (if
@@ -151,7 +179,7 @@ def assert_targets_within_electrical_range(id_positions: Sequence[tuple], durati
                 f"refusing to send SERVO_MOVE: duration_ms must be a positive integer, "
                 f"got {duration_ms!r}."
             )
-    for servo_id, position in id_positions:
+    for servo_id, position in normalize_targets(id_positions):
         if isinstance(servo_id, bool) or not isinstance(servo_id, int) or servo_id not in config.ELECTRICAL_LIMITS:
             raise IllegalServoTarget(
                 f"refusing to send SERVO_MOVE: servo id {servo_id!r} is not a known "
@@ -345,9 +373,10 @@ class HidTransport:
         ``assert_targets_within_electrical_range`` / ``IllegalServoTarget``.
         """
         require_motion_token(self, token)
-        assert_targets_within_electrical_range(id_positions, duration_ms)
-        params = [len(id_positions), duration_ms & 0xFF, (duration_ms >> 8) & 0xFF]
-        for servo_id, position in id_positions:
+        targets = normalize_targets(id_positions)
+        assert_targets_within_electrical_range(targets, duration_ms)
+        params = [len(targets), duration_ms & 0xFF, (duration_ms >> 8) & 0xFF]
+        for servo_id, position in targets:
             params.extend([servo_id, position & 0xFF, (position >> 8) & 0xFF])
         self.send(CMD_SERVO_MOVE, params)
 
