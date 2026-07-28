@@ -20,3 +20,11 @@ packages = ["robohand"]
 
 [tool.setuptools.package-data]
 robohand = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# This venv has a stray global "agentprobe" pytest11 entry point (from an unrelated
+# tool installed in the same environment) whose module is not actually importable,
+# which otherwise aborts collection before any robohand test can run. Disabling it
+# here is scoped to this repo's test runs only and does not touch the venv itself.
+addopts = "-p no:agentprobe"

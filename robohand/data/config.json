@@ -67,6 +67,24 @@
   "safety": {
     "requires_calibration": true,
     "open_loop": true,
-    "comment": "Controller does not answer CMD_MULT_SERVO_POS_READ -> NO position feedback, motion is open loop and stalls cannot be detected. Therefore limits must stay conservative and every servo must be unloaded (torque off) when not actively moving."
+    "provisional_band": 300,
+    "hold_ms": 2000,
+    "idle_unload_ms": 5000,
+    "max_continuous_torque_ms": 8000,
+    "comment": "Controller does not answer CMD_MULT_SERVO_POS_READ -> NO position feedback, motion is open loop and stalls cannot be detected by reading position. Therefore limits must stay conservative, every servo must be unloaded (torque off) shortly after each move (hold_ms) and on any idle period (idle_unload_ms), and a hard continuous-torque cap (max_continuous_torque_ms) forces an unload no matter what."
+  },
+  "vision": {
+    "roi": [0.15, 0.1, 0.7, 0.8],
+    "roi_comment": "Fractional [x, y, w, h] region of interest around the arm, in already-captured frame coordinates. Recalibrate for your camera placement.",
+    "diff_threshold": 25,
+    "min_changed_pixels": 150,
+    "blur_ksize": 5
+  },
+  "gripper": {
+    "step": 40,
+    "ladder_duration_ms": 250,
+    "grip_min_safe": 1220,
+    "grip_max_safe": 1780,
+    "comment": "Hard backstops for the incremental grip ladder. Never crossed regardless of what the vision guard reports."
   }
 }

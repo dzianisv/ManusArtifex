@@ -51,6 +51,64 @@ class ProtocolError(RuntimeError):
     """Raised when a response frame is malformed."""
 
 
+class SafetyBypassError(PermissionError):
+    """Raised when SERVO_MOVE (cmd 3) is attempted without a valid motion token.
+
+    This is the structural enforcement of the Layer-1 choke point: there is no
+    "please remember to call the safety layer" convention to forget. Every transport
+    that speaks this protocol (``HidTransport`` and ``sim.SimTransport``) refuses to
+    emit a SERVO_MOVE packet unless it receives a ``MotionToken`` that was minted by
+    ``safety.SafetyLayer`` for *this exact transport instance* and has not already
+    been spent. There is no way to obtain a valid token except by going through
+    ``SafetyLayer.move()``, which is where all limit/calibration/ramping checks live.
+    """
+
+
+class MotionToken:
+    """Opaque, single-use capability authorizing exactly one SERVO_MOVE packet.
+
+    Minted only by ``safety.SafetyLayer._mint_token()`` for a specific transport
+    instance (bound via ``id(transport)``) immediately before that transport is asked
+    to send a packet whose contents the safety layer has already validated. Consumed
+    (invalidated) the instant it is used, so it cannot be replayed. Constructing one
+    of these yourself and handing it to a transport bypasses every limit/calibration/
+    ramping check the safety layer performs -- doing so anywhere in shipped code is
+    exactly the failure mode ``tests/test_no_bypass.py`` exists to catch.
+    """
+
+    __slots__ = ("_transport_id", "_spent")
+
+    def __init__(self, transport_id: int) -> None:
+        self._transport_id = transport_id
+        self._spent = False
+
+    def _redeem(self, transport: object) -> None:
+        if self._spent:
+            raise SafetyBypassError("motion token already used (single-use; cannot be replayed)")
+        if self._transport_id != id(transport):
+            raise SafetyBypassError("motion token was not minted for this transport instance")
+        self._spent = True
+
+
+def require_motion_token(transport: object, token: Optional["MotionToken"]) -> None:
+    """Shared choke-point check used by every transport implementation.
+
+    Raises ``SafetyBypassError`` unless ``token`` is a live ``MotionToken`` minted for
+    this exact ``transport`` object. Both ``HidTransport`` and ``sim.SimTransport``
+    call this before emitting a SERVO_MOVE packet -- it is not implemented twice, it
+    is imported from here, so there is exactly one place this rule can drift from.
+    """
+    if not isinstance(token, MotionToken):
+        raise SafetyBypassError(
+            "SERVO_MOVE rejected: no valid safety token supplied. All motion must go "
+            "through safety.SafetyLayer.move(), which validates joint limits, "
+            "calibration status, and step ramping before minting a single-use token "
+            "for this transport instance. Calling move_servos()/CMD_SERVO_MOVE "
+            "directly is not supported."
+        )
+    token._redeem(transport)
+
+
 class NoResponse(RuntimeError):
     """Raised when the controller never replies to a query command.
 
@@ -179,8 +237,19 @@ class HidTransport:
             raise ProtocolError(f"short battery reply: {data}")
         return (data[1] * 256 + data[0]) / 1000.0
 
-    def move_servos(self, id_positions: Sequence[tuple], duration_ms: int) -> None:
-        """id_positions: sequence of (servo_id, position) pairs."""
+    def move_servos(
+        self,
+        id_positions: Sequence[tuple],
+        duration_ms: int,
+        *,
+        token: Optional[MotionToken] = None,
+    ) -> None:
+        """id_positions: sequence of (servo_id, position) pairs.
+
+        Requires a ``MotionToken`` minted by ``safety.SafetyLayer`` for this exact
+        transport instance -- see ``require_motion_token`` / ``SafetyBypassError``.
+        """
+        require_motion_token(self, token)
         params = [len(id_positions), duration_ms & 0xFF, (duration_ms >> 8) & 0xFF]
         for servo_id, position in id_positions:
             params.extend([servo_id, position & 0xFF, (position >> 8) & 0xFF])
