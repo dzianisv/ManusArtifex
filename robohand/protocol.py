@@ -20,19 +20,32 @@ regardless of the timeout argument -- so any reply that has not already arrived 
 the OS buffer is missed and ``read()`` returns an empty list, which the upstream code
 then indexes into unconditionally (``self._input_report[0]``), raising
 ``IndexError: list index out of range``. This module never enables non-blocking mode
-for command/response calls: reads are real blocking reads bounded by ``timeout_ms``,
-wrapped in a retry loop that also validates the ``0x55 0x55`` signature and discards
-any stray/asynchronous frames (e.g. action-group notifications) that don't match the
-command we asked for.
+for command/response calls: reads are real blocking reads bounded by a wall-clock
+deadline, wrapped in a loop that also validates the ``0x55 0x55`` signature and
+discards any stray/asynchronous frames that don't match the command we asked for.
+
+CMD_ACTION_GROUP_COMPLETE (cmd 8) handling: the controller sends this frame
+unsolicited, on its own schedule, whenever a stored action group finishes (e.g. one
+started directly on the device, or by ``pushButtons.py``'s ``CMD_ACTION_GROUP_RUN``
+outside this SDK). If left in the input queue, it corrupts the next expected reply --
+the reader would parse cmd-8's bytes as if they were an answer to whatever was asked
+next (e.g. a battery read), silently returning garbage. ``HidTransport.recv()``
+recognises and discards cmd-8 frames (and any other frame that doesn't match the
+cmd we're waiting for) without spending down the read-retry budget meant for genuine
+non-replies, and logs each occurrence at DEBUG. ``HidTransport.__init__`` also drains
+any frames already queued from before this process opened the device.
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import hid
+
+logger = logging.getLogger(__name__)
 
 SIGNATURE = 0x55
 REPORT_LENGTH = 64
@@ -41,6 +54,7 @@ REPORT_LENGTH = 64
 CMD_SERVO_MOVE = 3
 CMD_ACTION_GROUP_RUN = 6
 CMD_ACTION_GROUP_STOP = 7
+CMD_ACTION_GROUP_COMPLETE = 8  # controller -> host ONLY, always unsolicited -- see recv()
 CMD_ACTION_SPEED = 11
 CMD_GET_BATTERY_VOLTAGE = 15
 CMD_MULT_SERVO_UNLOAD = 20
@@ -159,6 +173,11 @@ class HidTransport:
         # Deliberately NOT calling set_nonblocking(1) here -- see module docstring.
         self.read_timeout_ms = read_timeout_ms
         self.read_retries = read_retries
+        # Flush any input reports already queued before this process opened the
+        # device (e.g. an ACTION_GROUP_COMPLETE left over from a stored action group
+        # that finished while nobody was reading) so the first real request() call
+        # doesn't have to discard it under time pressure.
+        self.drain()
 
     def close(self) -> None:
         try:
@@ -194,24 +213,47 @@ class HidTransport:
         """Block for a reply to ``cmd``, retrying on empty/short/mismatched frames.
 
         Returns the parameter bytes (not including header/length/cmd) on success, or
-        ``None`` if no matching reply arrived within the retry budget.
+        ``None`` if no matching reply arrived before the deadline.
+
+        Genuine misses (the read itself timed out with nothing at all in the
+        buffer) consume the ``retries`` budget. Frames that DID arrive but don't
+        match ``cmd`` -- including CMD_ACTION_GROUP_COMPLETE, which the controller
+        sends unsolicited whenever a stored action group finishes -- do not consume
+        that budget; they are logged and discarded, and we keep waiting, bounded
+        instead by an overall wall-clock deadline so a device that spews stray
+        frames forever still cannot hang this call indefinitely.
         """
         timeout_ms = self.read_timeout_ms if timeout_ms is None else timeout_ms
         retries = self.read_retries if retries is None else retries
-        for _ in range(max(1, retries)):
+        deadline = time.monotonic() + (timeout_ms / 1000.0) * max(1, retries)
+        misses = 0
+        while misses < max(1, retries) and time.monotonic() < deadline:
             try:
                 report = self._dev.read(REPORT_LENGTH, timeout_ms)
             except OSError:
                 # Transient HID stack hiccup -- treat as a missed reply and retry.
+                misses += 1
                 continue
             if not report or len(report) < 4:
+                misses += 1
                 continue
             if report[0] != SIGNATURE or report[1] != SIGNATURE:
+                misses += 1
                 continue
             length = report[2]
-            if report[3] != cmd:
-                # Stray/async frame (e.g. an action-group event) -- discard, keep waiting.
-                continue
+            got_cmd = report[3]
+            if got_cmd != cmd:
+                if got_cmd == CMD_ACTION_GROUP_COMPLETE:
+                    logger.debug(
+                        "recv(cmd=%s): discarded unsolicited ACTION_GROUP_COMPLETE frame "
+                        "(does not count against retry budget)", cmd,
+                    )
+                else:
+                    logger.debug(
+                        "recv(cmd=%s): discarded stray frame cmd=%s (does not count "
+                        "against retry budget)", cmd, got_cmd,
+                    )
+                continue  # a real frame arrived, just not the one we want -- don't count it as a miss
             n_params = max(length - 2, 0)
             return list(report[4 : 4 + n_params])
         return None
