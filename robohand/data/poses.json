@@ -12,10 +12,10 @@
     }
   },
   "open_grip": {
-    "comment": "Jaws open. 1600 stays 100 clear of the 1500 open stop.",
+    "comment": "Jaws open. GRIP is uncalibrated, so poses must stay inside its *provisional* band (center 1950 +/- 300 = 1650..2250), not just the wider configured 1600..2300 -- 1650 is the closest safe value to the 1500 open stop reachable without an explicit calibration override.",
     "duration_ms": 800,
     "positions": {
-      "GRIP": 1600
+      "GRIP": 1650
     }
   },
   "close_grip": {

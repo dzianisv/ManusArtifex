@@ -330,8 +330,25 @@ class Arm:
             raise ValueError("direction must be 'close' or 'open'")
         step = abs(step if step is not None else config.GRIP_STEP)
         duration_ms = duration_ms or config.GRIP_LADDER_DURATION_MS
-        sign = -1 if direction == "close" else 1
-        hard_stop = config.GRIP_MIN_SAFE if direction == "close" else config.GRIP_MAX_SAFE
+        # GRIP (servo 1) is a LeArm gripper servo where LOWER raw = MORE OPEN (see
+        # docs/research-hardware.md). So "close" increases the raw value toward
+        # grip_max_safe, and "open" decreases it toward grip_min_safe. Getting this
+        # backwards was the original incident: a "close" command of 700 was actually
+        # a large *decrease* far past the 1500 open stop, driving the jaws to full
+        # open and holding locked-rotor torque there.
+        sign = 1 if direction == "close" else -1
+        # The ladder's hard backstop is the *tighter* of two things: the configured
+        # grip_min_safe/grip_max_safe (a fixed physical margin from the mechanical
+        # stop) and GRIP's current calibration-aware effective bound (the provisional
+        # band while uncalibrated, the full configured range once calibrated). This
+        # keeps "uncalibrated joints are clamped to the provisional band" true for
+        # the ladder too -- it never silently steps itself past the provisional band
+        # just because grip_min_safe/grip_max_safe happen to be wider than it.
+        eff_lo, eff_hi = config.effective_bounds("GRIP")
+        if direction == "close":
+            hard_stop = min(config.GRIP_MAX_SAFE, eff_hi)
+        else:
+            hard_stop = max(config.GRIP_MIN_SAFE, eff_lo)
 
         current = self._shadow.get("GRIP")
         if current is None:
@@ -345,9 +362,9 @@ class Arm:
         max_iterations = 200  # generous bound; real bands are far smaller than this
         for _ in range(max_iterations):
             next_pos = current + sign * step
-            if direction == "close" and next_pos <= hard_stop:
+            if direction == "close" and next_pos >= hard_stop:
                 next_pos = hard_stop
-            elif direction == "open" and next_pos >= hard_stop:
+            elif direction == "open" and next_pos <= hard_stop:
                 next_pos = hard_stop
 
             # vision_guard=None: disable SafetyLayer's own automatic hard-fail vision

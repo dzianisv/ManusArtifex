@@ -47,11 +47,14 @@ class CalibrationRequired(SafetyViolation):
 
 
 class OutOfGlobalGuard(SafetyViolation):
-    """Raised only if something computed a target outside the 700..2300 rail.
+    """Raised only if something computed a target outside a joint's absolute rail.
 
-    In normal operation this should be unreachable -- ``config.effective_bounds``
-    always intersects with the global guard before we ever get here. It exists as a
-    final, loud backstop in case of a future bug in the bounds computation.
+    "Absolute" means ``config.absolute_bounds(name)`` -- the flat 700..2300
+    GLOBAL_GUARD_MIN/MAX pair, tightened per-servo where a joint's own hardware
+    demands it (e.g. GRIP's 1500 floor). In normal operation this should be
+    unreachable -- ``config.effective_bounds`` always intersects with
+    ``absolute_bounds`` before we ever get here. It exists as a final, loud
+    backstop in case of a future bug in the bounds computation.
     """
 
 
@@ -131,7 +134,8 @@ class SafetyLayer:
         ``allow_uncalibrated_override=True`` is passed together with a non-empty
         ``override_reason`` -- that combination is logged as a WARNING (audit trail)
         and widens the allowed band to the joint's configured min/max (still
-        intersected with the global 700..2300 guard, which can never be widened).
+        intersected with that joint's absolute guard, ``config.absolute_bounds``,
+        which can never be widened).
         """
         if self._closed:
             raise SafetyViolation("SafetyLayer is closed; all servos have been unloaded")
@@ -160,11 +164,15 @@ class SafetyLayer:
                     "an explicit, logged override if you really mean to widen the band."
                 )
             clamped = max(lo, min(hi, requested))
-            if not (config.GLOBAL_GUARD_MIN <= clamped <= config.GLOBAL_GUARD_MAX):
-                # Unreachable given effective_bounds always intersects the guard --
-                # kept as a loud backstop against future regressions.
-                raise OutOfGlobalGuard(f"{key} target {clamped} outside global guard "
-                                        f"[{config.GLOBAL_GUARD_MIN}, {config.GLOBAL_GUARD_MAX}]")
+            abs_lo, abs_hi = config.absolute_bounds(key)
+            if not (abs_lo <= clamped <= abs_hi):
+                # Unreachable given effective_bounds always intersects absolute_bounds --
+                # kept as a loud backstop against future regressions. Deliberately
+                # per-servo (not the flat GLOBAL_GUARD_MIN/MAX pair): GRIP's own floor
+                # is 1500, stricter than the generic 700 that is fine for every other
+                # joint (see docs/research-hardware.md).
+                raise OutOfGlobalGuard(f"{key} target {clamped} outside absolute guard "
+                                        f"[{abs_lo}, {abs_hi}]")
             targets[key] = clamped
             known_current = current.get(key)
             starts[key] = int(known_current) if known_current is not None else clamped
@@ -197,7 +205,8 @@ class SafetyLayer:
                     pos = int(round(start + (target - start) * frac))
                     lo, hi = config.effective_bounds(name, allow_uncalibrated_override=allow_uncalibrated_override)
                     pos = max(lo, min(hi, pos))
-                    pos = max(config.GLOBAL_GUARD_MIN, min(config.GLOBAL_GUARD_MAX, pos))
+                    abs_lo, abs_hi = config.absolute_bounds(name)
+                    pos = max(abs_lo, min(abs_hi, pos))
                     id_positions.append((config.resolve_servo(name), pos))
                 step_duration = max(config.MIN_DURATION_MS, duration_ms // steps)
                 self._transport.move_servos(id_positions, step_duration, token=self._mint_token())

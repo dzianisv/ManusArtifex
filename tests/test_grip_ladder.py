@@ -4,6 +4,12 @@ recorded stall time, because contact with an obstruction is normal gripper
 behaviour, not a destructive locked-rotor stall (see ``sim.SimJoint.command``'s
 distinction between ``mech_min/max`` and ``obstruction_min/max``).
 
+Direction note (see docs/research-hardware.md): GRIP is a LeArm gripper servo where
+LOWER raw = MORE OPEN. So "close" INCREASES the raw value toward grip_max_safe
+(2300, capped by the provisional band to 2250 while uncalibrated) and "open"
+DECREASES it toward grip_min_safe (1600, floored by the provisional band to 1650
+while uncalibrated). Getting this backwards was the original incident.
+
 The synthetic camera frame source renders a single vertical bar whose x-position
 tracks the sim's own GRIP position, so frame differencing genuinely reflects
 "did the simulated jaw move" -- once ``SimJoint.command`` clamps to the obstruction
@@ -38,29 +44,33 @@ def _make_frame_source(arm: Arm):
 
 def test_grip_ladder_stops_on_contact():
     with Arm(sim=True, use_vision=False, install_signal_handlers=False) as arm:
-        # Simulate an object in the jaws that blocks travel well short of the
-        # mechanical end stop (1150) -- e.g. a rigid object at 1400.
-        arm._transport.set_obstruction(GRIP_SERVO_ID, min=1400)
+        # Simulate an object in the jaws that blocks further CLOSING (increasing
+        # raw value) well short of both the ladder's own backstop (2250, while
+        # uncalibrated) and the true mechanical end stop (2500) -- e.g. a rigid
+        # object making contact at 2000.
+        arm._transport.set_obstruction(GRIP_SERVO_ID, max=2000)
         arm.vision_guard = VisionGuard(
             frame_source=_make_frame_source(arm),
             min_changed_pixels=20,
         )
-        # Start from a known, safely-open position so the ladder has room to close.
+        # Start from a known, safely-open-ish position so the ladder has room to
+        # close (increase) before hitting the obstruction.
         arm.set_position("GRIP", 1700, hold=["GRIP"], wait=False)
 
         result = arm.close_grip(step=40)
 
     assert result["stopped_reason"] == "no_motion_detected", result
-    # The ladder must have actually made progress toward closing before stopping.
-    assert result["final_position"] < 1700
+    # The ladder must have actually made progress toward closing (increasing) before
+    # stopping.
+    assert result["final_position"] > 1700
     # Note: "final_position"/"contact_position" are *commanded* values, not
     # feedback-verified physical positions -- there is no position feedback on this
     # hardware (see protocol.NoResponse), so the sim's obstruction may silently clamp
     # a requested target short of what was asked, exactly as the real servo would.
     # The invariant we can actually assert is direction: backing off from a "close"
-    # ladder must land at a *less closed* (larger) commanded position than the one
-    # where motion ceased.
-    assert result["final_position"] > result["contact_position"]
+    # ladder (which increases) must land at a *less closed* (smaller) commanded
+    # position than the one where motion ceased.
+    assert result["final_position"] < result["contact_position"]
     # The whole point: contact with an object is NOT a stall.
     assert arm._transport.stall_ms_total() == 0
     assert arm._transport.joints[GRIP_SERVO_ID].torque_on is False
@@ -68,8 +78,10 @@ def test_grip_ladder_stops_on_contact():
 
 def test_grip_ladder_respects_hard_backstop_without_vision():
     """Even with no vision guard at all (degrade-safely case), the ladder must never
-    drive past ``GRIP_MIN_SAFE`` / ``GRIP_MAX_SAFE`` -- the hard backstop is
-    independent of whether a camera is attached.
+    drive past its hard backstop -- the tighter of ``grip_max_safe`` and GRIP's
+    current calibration-aware effective bound (the provisional band while
+    uncalibrated: 2250, not the full configured 2300) -- independent of whether a
+    camera is attached.
     """
     from robohand import config
 
@@ -78,22 +90,32 @@ def test_grip_ladder_respects_hard_backstop_without_vision():
         arm.set_position("GRIP", 1700, hold=["GRIP"], wait=False)
         result = arm.close_grip(step=40)
 
-    assert result["final_position"] == config.GRIP_MIN_SAFE
-    assert result["final_position"] >= 1150  # strictly inside the mechanical stop
+    eff_lo, eff_hi = config.effective_bounds("GRIP")
+    expected_backstop = min(config.GRIP_MAX_SAFE, eff_hi)
+    assert result["final_position"] == expected_backstop
+    assert result["final_position"] < 2500  # strictly inside the mechanical stop
     assert arm._transport.stall_ms_total() == 0
 
 
 def test_grip_ladder_open_direction_stops_on_contact():
     with Arm(sim=True, use_vision=False, install_signal_handlers=False) as arm:
-        arm._transport.set_obstruction(GRIP_SERVO_ID, max=1600)
+        # Blocks further OPENING (decreasing raw value) well short of both the
+        # ladder's own backstop (1650, while uncalibrated) and the true mechanical
+        # open stop (1500).
+        arm._transport.set_obstruction(GRIP_SERVO_ID, min=1900)
         arm.vision_guard = VisionGuard(
             frame_source=_make_frame_source(arm),
             min_changed_pixels=20,
         )
-        arm.set_position("GRIP", 1300, hold=["GRIP"], wait=False)
+        # Start from a known, safely-closed-ish position so the ladder has room to
+        # open (decrease) before hitting the obstruction.
+        arm.set_position("GRIP", 2200, hold=["GRIP"], wait=False)
 
         result = arm.open_grip(step=40)
 
     assert result["stopped_reason"] == "no_motion_detected", result
-    assert result["final_position"] > 1300
+    assert result["final_position"] < 2200
+    # Backing off from an "open" ladder (which decreases) must land at a *less open*
+    # (larger) commanded position than the one where motion ceased.
+    assert result["final_position"] > result["contact_position"]
     assert arm._transport.stall_ms_total() == 0

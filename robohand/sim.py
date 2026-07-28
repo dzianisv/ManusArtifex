@@ -35,8 +35,15 @@ from .protocol import MotionToken, NoResponse, require_motion_token
 # Plausible mechanical end stops per servo id, narrower than the 500..2500
 # electrical range. These are *not* the configured safe operating band (which is
 # narrower still) -- they represent where the physical jaws/links actually jam.
+#
+# GRIP (servo id 1) is the one exception where "mechanical stop" and "electrical
+# range" are almost the same thing: it is a LeArm gripper servo whose *own*
+# reference firmware clamps it to 1500..2500 (not the generic 500..2500), and
+# 1500 is confirmed to be its open mechanical stop (lower raw = more open). We
+# model 2500 as its closed-on-itself stop (no confirmed measurement beyond "it is
+# the electrical ceiling"; see docs/research-hardware.md open questions).
 DEFAULT_MECHANICAL_LIMITS: Dict[int, Tuple[int, int]] = {
-    1: (1150, 1850),  # GRIP
+    1: (1500, 2500),  # GRIP -- LeArm gripper servo, confirmed 1500..2500 (not 500..2500)
     2: (900, 2100),  # WRIST_ROLL
     3: (900, 2100),  # WRIST_FLEX
     4: (850, 2150),  # ELBOW
