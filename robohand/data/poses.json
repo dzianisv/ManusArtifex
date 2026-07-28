@@ -1,0 +1,28 @@
+{
+  "home": {
+    "comment": "All joints centered. Safe.",
+    "duration_ms": 1500,
+    "positions": {
+      "GRIP": 1500,
+      "WRIST_ROLL": 1500,
+      "WRIST_FLEX": 1500,
+      "ELBOW": 1500,
+      "SHOULDER_LIFT": 1500,
+      "SHOULDER_PAN": 1500
+    }
+  },
+  "open_grip": {
+    "comment": "Gripper open, safe band. NOT the mechanical limit.",
+    "duration_ms": 600,
+    "positions": {
+      "GRIP": 1750
+    }
+  },
+  "close_grip": {
+    "comment": "Gripper partially closed. NEVER go below 1250 on empty air: the jaws hit their end stop and the servo stalls. This caused the 2026-07-28 incident.",
+    "duration_ms": 600,
+    "positions": {
+      "GRIP": 1300
+    }
+  }
+}

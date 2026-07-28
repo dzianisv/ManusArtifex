@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robohand"
+version = "0.1.0"
+description = "Control library and CLI for the Hiwonder/LewanSoul LeArm (xArm 1S, LSC-6) 6-DOF robotic arm"
+readme = "docs/robohand.md"
+requires-python = ">=3.9"
+dependencies = [
+    "hidapi>=0.14",
+]
+
+[project.scripts]
+robohand = "robohand.cli:main"
+
+[tool.setuptools]
+packages = ["robohand"]
+
+[tool.setuptools.package-data]
+robohand = ["data/*.json"]
