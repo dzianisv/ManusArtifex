@@ -272,3 +272,289 @@ to oversell:
    this individual unit's servo has been reprogrammed or differs from the
    reference. The calibration procedure in `docs/safety.md` is what actually
    settles this for good, and it still has not been performed.
+
+## 2026-07-28 (session 2): full entry-point hardening — reject over clamp, everywhere
+
+Follow-up task: audit and close *every* remaining path by which an
+out-of-electrical-range servo position could reach a servo, from any entry
+point (`config.json`, `poses.json`, sequence/`play` files, CLI parsing,
+`pose --save`/`teach` write paths, `--force`/override flags, the grip ladder,
+ramp interpolation, and the transport layer itself). As before, **all
+validation in this section runs against `robohand.sim.SimTransport` only —
+no command here ever opened the real HID device (VID 0x0483 / PID 0x5750).**
+
+### Design change: one hardcoded source of truth for electrical limits
+
+`robohand/config.py` now defines:
+
+```python
+CANONICAL_JOINTS: Dict[str, int] = {"GRIP": 1, "WRIST_ROLL": 2, ...}
+ELECTRICAL_LIMITS: Dict[int, Tuple[int, int]] = {
+    1: (1500, 2500),  # GRIP
+    2: (500, 2500), 3: (500, 2500), 4: (500, 2500),
+    5: (500, 2500), 6: (500, 2500),
+}
+```
+
+Every other bound in the package (`GLOBAL_GUARD_MIN/MAX`, per-joint configured
+min/max, the provisional band, the grip ladder backstops, the transport-layer
+assertion) is derived from this table and can only ever be equal to or
+narrower than it. This replaces the old `ABSOLUTE_MIN_OVERRIDE`/
+`ABSOLUTE_MAX_OVERRIDE` dicts, which existed but were not consistently
+consulted by every entry point.
+
+### Entry points found and how each is now guarded
+
+| # | Entry point | Guard added/verified | Previously guarded? |
+|---|---|---|---|
+| 1 | `config.json` loading (`config._validate_servo_spec`) | Rejects (raises `ConfigError`, naming the offending key) an unknown joint name, a servo id that disagrees with fixed wiring, missing/non-integer min/max, inverted min/max, a range wider than `ELECTRICAL_LIMITS`, a center outside its own configured band, a non-bool `calibrated`. Tripwires cross-check `hardware_limits.min/max` and `safety.gripper_absolute_floor` against the hardcoded constants. | **Partially** — some checks existed; inverted min/max, out-of-electrical-range widening, and unknown-joint-name were **not** previously rejected (silently intersected or accepted). |
+| 2 | `poses.json` loading (`poses.load_poses`) | Every pose's `positions`/`duration_ms` validated via `config.validate_positions`/`validate_duration_ms` at load time; raises `InvalidPosition` naming the pose and joint. | **No** — previously loaded with zero validation; an illegal value would only have been caught later, at move time. |
+| 3 | `pose --save` / `teach` write paths (`poses.save_pose`, `cli.cmd_teach`) | `save_pose` validates before writing (a rejected save touches nothing on disk). `cmd_teach`'s hand-typed-input path now calls `config.validate_position_value` and **rejects** (previously called `config.clamp`, i.e. silently substituted a different value). | **No** — `save_pose` had no validation; `cmd_teach` silently clamped illegal hand-typed input. |
+| 4 | Sequence/`play` files (`sequences.py`) | New `validate_sequence(steps)` validates every step's positions/pose-reference/duration up front; called by `load_sequence` (load time) *and* again at the start of `play_sequence` (defense in depth) so a bad step anywhere rejects the **whole** sequence before any motion starts. `save_sequence`/`record_interactive` also validate before writing. | **No** — `play_sequence` previously validated/executed steps lazily one at a time, so steps before a bad one would already have moved the arm ("half-executed"). |
+| 5 | CLI parsing (`cli.py`: `_parse_joints`, `cmd_move`, `cmd_grip` `--step`) | `_parse_joints` catches `json.JSONDecodeError` and routes through `config.validate_positions` (rejects non-integers, out-of-range, unknown names). `cmd_move`'s `--servo/--pos` branch validates before constructing `Arm`. `cmd_grip`'s `--step` (via `arm._grip_ladder`) now rejects non-positive step values instead of silently `abs()`-ing them. `main()` now catches `config.InvalidPosition`/`ConfigError`, `json.JSONDecodeError`, `KeyError`, and generic `ValueError`, printing a clear message and exiting non-zero. | **No** — `_parse_joints` let raw `JSONDecodeError`/`ValueError`/`KeyError` escape uncaught; `--step` silently flipped the sign of a negative value. |
+| 6 | `--override-reason` (`safety.SafetyLayer.move`) | Rewritten to **never** clamp a user-supplied final target: out-of-band requests raise `CalibrationRequired` (uncalibrated, no override) or the new `PositionOutOfRange` (calibrated, or override supplied but still out of range) — including when the override is used. An override can still only widen *up to* the joint's own configured min/max (itself always ⊆ the electrical range) — it can never reach past `ELECTRICAL_LIMITS`, and GRIP can never go below 1500 even with an override. | **No — this was the most significant gap.** The prior implementation *silently clamped* an out-of-band override request to the nearest legal value instead of refusing — the same failure class as the original incident (a bad input silently turned into a different, unnoticed value). Two existing tests (`test_gripper_incident.py::test_gripper_floor_enforced`, `test_gripper_cannot_reach_end_stop_even_with_override`) asserted this clamp behavior; both were rewritten to assert rejection instead. |
+| 7 | Grip ladder (`arm._grip_ladder`) | Every rung (including the back-off step) already routed through `Arm.set_position` → `SafetyLayer.move`, which now rejects rather than clamps out-of-band requests; `--step` itself is now validated (see #5). | **Yes** (rungs were already range-checked structurally) — only the `--step` sign-flip was a gap. |
+| 8 | Ramp interpolation (`safety.SafetyLayer.move`, inner loop) | Intermediate steps are still clamped (the *only* place clamping remains legal, per the task's design mandate) but now `logger.warning(...)` fires whenever a clamp actually changes a value — this should be mathematically unreachable for a legal start/target pair, so a warning firing is itself a signal something upstream is wrong. | **Yes**, structurally safe already; logging was the only gap. |
+| 9 | Transport layer (`protocol.py`, `sim.py`) | New `assert_targets_within_electrical_range()` / `IllegalServoTarget` exception, called by **both** `HidTransport.move_servos` and `SimTransport.move_servos` immediately after the `MotionToken` check and before any bytes/state changes — validates every `(servo_id, position)` pair against `ELECTRICAL_LIMITS` and `duration_ms` is a sane positive int. Proven to reject even a **valid, correctly-minted `MotionToken`** carrying an illegal position. | **No — this was a real gap.** `move_servos` on both transports previously checked only for a valid token; a valid token carrying an illegal position would have gone straight to the wire (or the simulator). |
+| 10 | Duration/time parameters (`config.validate_duration_ms`) | Non-positive, non-integer, or absurd (>60s) durations raise `InvalidPosition` — enforced at `SafetyLayer.move` and again at the transport backstop. | **No** — durations were passed through with no positivity/sanity check. |
+
+### Previously-unguarded paths found (honest summary)
+
+The most significant finding: **`safety.SafetyLayer.move` silently clamped an
+out-of-band override request instead of rejecting it** — this is the exact
+failure mode that caused the original incident (a numeric input that didn't
+match intent was silently turned into *some* other value rather than refused).
+Beyond that: the transport layer had **no position-range check at all** (item
+9); sequences could be **half-executed** before hitting a bad step (item 4);
+`poses.json` and `config.json` were both loaded with **materially incomplete
+validation** (items 1–2); `cmd_teach` used `config.clamp` on hand-typed input
+(item 3); CLI JSON/type errors could **escape uncaught** (item 5); and the
+grip ladder's `--step` silently flipped the sign of a negative value instead
+of rejecting it (item 7).
+
+### New test suite: `tests/test_range_enforcement.py`
+
+134 new table-driven tests covering: GRIP at 700/1000/1499/2501/-5/0/"abc"/1e9
+rejected via direct API, CLI `move --joints`, CLI `move --servo/--pos`, pose
+file load, sequence file load, `pose --save`, `teach`, and raw transport call;
+every non-gripper servo at 499/2501 rejected the same way; malformed
+`config.json` (inverted min/max, out-of-electrical-range, unknown joint name,
+non-integer value, out-of-band center) rejected at import time with a clear
+message naming the offending key; override cannot escape the electrical range
+or take GRIP below 1500 (but still succeeds for an in-band override request);
+ramp intermediates proven in-range for two independent long moves; a sequence
+with one illegal step proven to produce **zero** `MOVE` packets; `stall_ms_total()
+== 0` asserted wherever motion actually occurs; non-positive/absurd durations
+rejected at both `SafetyLayer` and the transport backstop.
+
+### Full pytest output (164/164 passed)
+
+```
+$ python3 -m pytest tests/ -v
+============================= test session starts ==============================
+platform darwin -- Python 3.10.19, pytest-9.0.2, pluggy-1.6.0 -- /Users/engineer/.venv/bin/python3
+cachedir: .pytest_cache
+rootdir: /Users/engineer/workspace/ManusArtifex
+configfile: pyproject.toml
+plugins: anyio-4.12.1, mock-3.15.1, repeat-0.9.4, langsmith-0.10.9, xdist-3.8.0, a-test-0.0.1.dev30+g70229f16e, typeguard-4.5.1, asyncio-1.3.0, deepeval-3.8.8, rerunfailures-16.1
+asyncio: mode=strict, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 164 items
+
+tests/test_calibration.py::test_uncalibrated_joint_refuses_out_of_band_move PASSED [  0%]
+tests/test_calibration.py::test_uncalibrated_joint_allows_in_band_move PASSED [  1%]
+tests/test_calibration.py::test_cli_move_refuses_and_exits_non_zero PASSED [  1%]
+tests/test_grip_ladder.py::test_grip_ladder_stops_on_contact PASSED      [  2%]
+tests/test_grip_ladder.py::test_grip_ladder_respects_hard_backstop_without_vision PASSED [  3%]
+tests/test_grip_ladder.py::test_grip_ladder_open_direction_stops_on_contact PASSED [  3%]
+tests/test_gripper_incident.py::test_gripper_cannot_reach_end_stop PASSED [  4%]
+tests/test_gripper_incident.py::test_gripper_cannot_reach_end_stop_even_with_override PASSED [  4%]
+tests/test_gripper_incident.py::test_gripper_floor_enforced PASSED       [  5%]
+tests/test_hid_framing.py::test_unsolicited_action_group_complete_is_drained_not_misparsed PASSED [  6%]
+tests/test_hid_framing.py::test_stray_frames_do_not_consume_the_retry_budget PASSED [  6%]
+tests/test_hid_framing.py::test_genuine_non_reply_still_times_out PASSED [  7%]
+tests/test_hid_framing.py::test_init_drains_stale_queue_before_first_request PASSED [  7%]
+tests/test_no_bypass.py::test_no_path_bypasses_safety_missing_token PASSED [  8%]
+tests/test_no_bypass.py::test_no_path_bypasses_safety_wrong_transport_token PASSED [  9%]
+tests/test_no_bypass.py::test_no_path_bypasses_safety_reused_token PASSED [  9%]
+tests/test_poses.py::test_all_poses_within_safe_band PASSED              [ 10%]
+tests/test_poses.py::test_all_poses_within_global_guard PASSED           [ 10%]
+tests/test_ramping.py::test_large_move_is_ramped PASSED                  [ 11%]
+tests/test_ramping.py::test_small_move_is_a_single_step PASSED           [ 12%]
+tests/test_range_enforcement.py::test_direct_api_rejects_illegal_grip_int[700] PASSED [ 12%]
+tests/test_range_enforcement.py::test_direct_api_rejects_illegal_grip_int[1000] PASSED [ 13%]
+tests/test_range_enforcement.py::test_direct_api_rejects_illegal_grip_int[1499] PASSED [ 14%]
+tests/test_range_enforcement.py::test_direct_api_rejects_illegal_grip_int[2501] PASSED [ 14%]
+tests/test_range_enforcement.py::test_direct_api_rejects_illegal_grip_int[-5] PASSED [ 15%]
+tests/test_range_enforcement.py::test_direct_api_rejects_illegal_grip_int[0] PASSED [ 15%]
+tests/test_range_enforcement.py::test_direct_api_rejects_illegal_grip_non_int[abc] PASSED [ 16%]
+tests/test_range_enforcement.py::test_direct_api_rejects_illegal_grip_non_int[1000000000.0] PASSED [ 17%]
+tests/test_range_enforcement.py::test_direct_api_rejects_illegal_grip_non_int[1500.0] PASSED [ 17%]
+tests/test_range_enforcement.py::test_direct_api_rejects_illegal_grip_non_int[True] PASSED [ 18%]
+tests/test_range_enforcement.py::test_direct_api_safety_layer_rejects_illegal_grip[700] PASSED [ 18%]
+tests/test_range_enforcement.py::test_direct_api_safety_layer_rejects_illegal_grip[1000] PASSED [ 19%]
+tests/test_range_enforcement.py::test_direct_api_safety_layer_rejects_illegal_grip[1499] PASSED [ 20%]
+tests/test_range_enforcement.py::test_direct_api_safety_layer_rejects_illegal_grip[2501] PASSED [ 20%]
+tests/test_range_enforcement.py::test_direct_api_safety_layer_rejects_illegal_grip[-5] PASSED [ 21%]
+tests/test_range_enforcement.py::test_direct_api_safety_layer_rejects_illegal_grip[0] PASSED [ 21%]
+tests/test_range_enforcement.py::test_direct_api_safety_layer_rejects_illegal_grip_non_int[abc] PASSED [ 22%]
+tests/test_range_enforcement.py::test_direct_api_safety_layer_rejects_illegal_grip_non_int[1000000000.0] PASSED [ 23%]
+tests/test_range_enforcement.py::test_direct_api_rejects_non_grip_out_of_electrical_range[499-WRIST_ROLL] PASSED [ 23%]
+tests/test_range_enforcement.py::test_direct_api_rejects_non_grip_out_of_electrical_range[499-WRIST_FLEX] PASSED [ 24%]
+tests/test_range_enforcement.py::test_direct_api_rejects_non_grip_out_of_electrical_range[499-ELBOW] PASSED [ 25%]
+tests/test_range_enforcement.py::test_direct_api_rejects_non_grip_out_of_electrical_range[499-SHOULDER_LIFT] PASSED [ 25%]
+tests/test_range_enforcement.py::test_direct_api_rejects_non_grip_out_of_electrical_range[499-SHOULDER_PAN] PASSED [ 26%]
+tests/test_range_enforcement.py::test_direct_api_rejects_non_grip_out_of_electrical_range[2501-WRIST_ROLL] PASSED [ 26%]
+tests/test_range_enforcement.py::test_direct_api_rejects_non_grip_out_of_electrical_range[2501-WRIST_FLEX] PASSED [ 27%]
+tests/test_range_enforcement.py::test_direct_api_rejects_non_grip_out_of_electrical_range[2501-ELBOW] PASSED [ 28%]
+tests/test_range_enforcement.py::test_direct_api_rejects_non_grip_out_of_electrical_range[2501-SHOULDER_LIFT] PASSED [ 28%]
+tests/test_range_enforcement.py::test_direct_api_rejects_non_grip_out_of_electrical_range[2501-SHOULDER_PAN] PASSED [ 29%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_illegal_grip[700] PASSED [ 29%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_illegal_grip[1000] PASSED [ 30%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_illegal_grip[1499] PASSED [ 31%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_illegal_grip[2501] PASSED [ 31%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_illegal_grip[-5] PASSED [ 32%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_illegal_grip[0] PASSED [ 32%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_illegal_grip_non_int["abc"] PASSED [ 33%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_illegal_grip_non_int[1e9] PASSED [ 34%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_malformed_json PASSED [ 34%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_unknown_joint_name PASSED [ 35%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_non_grip_out_of_range[499-WRIST_ROLL] PASSED [ 35%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_non_grip_out_of_range[499-WRIST_FLEX] PASSED [ 36%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_non_grip_out_of_range[499-ELBOW] PASSED [ 37%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_non_grip_out_of_range[499-SHOULDER_LIFT] PASSED [ 37%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_non_grip_out_of_range[499-SHOULDER_PAN] PASSED [ 38%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_non_grip_out_of_range[2501-WRIST_ROLL] PASSED [ 39%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_non_grip_out_of_range[2501-WRIST_FLEX] PASSED [ 39%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_non_grip_out_of_range[2501-ELBOW] PASSED [ 40%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_non_grip_out_of_range[2501-SHOULDER_LIFT] PASSED [ 40%]
+tests/test_range_enforcement.py::test_cli_move_joints_rejects_non_grip_out_of_range[2501-SHOULDER_PAN] PASSED [ 41%]
+tests/test_range_enforcement.py::test_cli_move_servo_pos_rejects_illegal_grip[700] PASSED [ 42%]
+tests/test_range_enforcement.py::test_cli_move_servo_pos_rejects_illegal_grip[1000] PASSED [ 42%]
+tests/test_range_enforcement.py::test_cli_move_servo_pos_rejects_illegal_grip[1499] PASSED [ 43%]
+tests/test_range_enforcement.py::test_cli_move_servo_pos_rejects_illegal_grip[2501] PASSED [ 43%]
+tests/test_range_enforcement.py::test_cli_move_servo_pos_rejects_illegal_grip[-5] PASSED [ 44%]
+tests/test_range_enforcement.py::test_cli_move_servo_pos_rejects_illegal_grip[0] PASSED [ 45%]
+tests/test_range_enforcement.py::test_cli_move_servo_pos_rejects_non_integer PASSED [ 45%]
+tests/test_range_enforcement.py::test_cli_grip_rejects_non_positive_step[-5] PASSED [ 46%]
+tests/test_range_enforcement.py::test_cli_grip_rejects_non_positive_step[0] PASSED [ 46%]
+tests/test_range_enforcement.py::test_pose_file_rejects_illegal_grip_at_load[700] PASSED [ 47%]
+tests/test_range_enforcement.py::test_pose_file_rejects_illegal_grip_at_load[1000] PASSED [ 48%]
+tests/test_range_enforcement.py::test_pose_file_rejects_illegal_grip_at_load[1499] PASSED [ 48%]
+tests/test_range_enforcement.py::test_pose_file_rejects_illegal_grip_at_load[2501] PASSED [ 49%]
+tests/test_range_enforcement.py::test_pose_file_rejects_illegal_grip_at_load[-5] PASSED [ 50%]
+tests/test_range_enforcement.py::test_pose_file_rejects_illegal_grip_at_load[0] PASSED [ 50%]
+tests/test_range_enforcement.py::test_pose_file_rejects_non_grip_out_of_range_at_load[499-WRIST_ROLL] PASSED [ 51%]
+tests/test_range_enforcement.py::test_pose_file_rejects_non_grip_out_of_range_at_load[499-WRIST_FLEX] PASSED [ 51%]
+tests/test_range_enforcement.py::test_pose_file_rejects_non_grip_out_of_range_at_load[499-ELBOW] PASSED [ 52%]
+tests/test_range_enforcement.py::test_pose_file_rejects_non_grip_out_of_range_at_load[499-SHOULDER_LIFT] PASSED [ 53%]
+tests/test_range_enforcement.py::test_pose_file_rejects_non_grip_out_of_range_at_load[499-SHOULDER_PAN] PASSED [ 53%]
+tests/test_range_enforcement.py::test_pose_file_rejects_non_grip_out_of_range_at_load[2501-WRIST_ROLL] PASSED [ 54%]
+tests/test_range_enforcement.py::test_pose_file_rejects_non_grip_out_of_range_at_load[2501-WRIST_FLEX] PASSED [ 54%]
+tests/test_range_enforcement.py::test_pose_file_rejects_non_grip_out_of_range_at_load[2501-ELBOW] PASSED [ 55%]
+tests/test_range_enforcement.py::test_pose_file_rejects_non_grip_out_of_range_at_load[2501-SHOULDER_LIFT] PASSED [ 56%]
+tests/test_range_enforcement.py::test_pose_file_rejects_non_grip_out_of_range_at_load[2501-SHOULDER_PAN] PASSED [ 56%]
+tests/test_range_enforcement.py::test_pose_file_shipped_data_still_loads PASSED [ 57%]
+tests/test_range_enforcement.py::test_sequence_file_rejects_illegal_grip_at_load[700] PASSED [ 57%]
+tests/test_range_enforcement.py::test_sequence_file_rejects_illegal_grip_at_load[1000] PASSED [ 58%]
+tests/test_range_enforcement.py::test_sequence_file_rejects_illegal_grip_at_load[1499] PASSED [ 59%]
+tests/test_range_enforcement.py::test_sequence_file_rejects_illegal_grip_at_load[2501] PASSED [ 59%]
+tests/test_range_enforcement.py::test_sequence_file_rejects_illegal_grip_at_load[-5] PASSED [ 60%]
+tests/test_range_enforcement.py::test_sequence_file_rejects_illegal_grip_at_load[0] PASSED [ 60%]
+tests/test_range_enforcement.py::test_sequence_with_one_illegal_step_performs_zero_motion PASSED [ 61%]
+tests/test_range_enforcement.py::test_sequence_file_rejects_unknown_pose_reference PASSED [ 62%]
+tests/test_range_enforcement.py::test_pose_save_refuses_to_write_illegal_grip[700] PASSED [ 62%]
+tests/test_range_enforcement.py::test_pose_save_refuses_to_write_illegal_grip[1000] PASSED [ 63%]
+tests/test_range_enforcement.py::test_pose_save_refuses_to_write_illegal_grip[1499] PASSED [ 64%]
+tests/test_range_enforcement.py::test_pose_save_refuses_to_write_illegal_grip[2501] PASSED [ 64%]
+tests/test_range_enforcement.py::test_pose_save_refuses_to_write_illegal_grip[-5] PASSED [ 65%]
+tests/test_range_enforcement.py::test_pose_save_refuses_to_write_illegal_grip[0] PASSED [ 65%]
+tests/test_range_enforcement.py::test_pose_save_refuses_illegal_value_without_disturbing_existing_file PASSED [ 66%]
+tests/test_range_enforcement.py::test_cli_teach_rejects_illegal_hand_typed_position PASSED [ 67%]
+tests/test_range_enforcement.py::test_cli_teach_rejects_non_integer_hand_typed_position PASSED [ 67%]
+tests/test_range_enforcement.py::test_cli_pose_save_writes_only_legal_positions PASSED [ 68%]
+tests/test_range_enforcement.py::test_config_json_rejects_inverted_min_max PASSED [ 68%]
+tests/test_range_enforcement.py::test_config_json_rejects_out_of_electrical_range PASSED [ 69%]
+tests/test_range_enforcement.py::test_config_json_rejects_grip_below_electrical_floor PASSED [ 70%]
+tests/test_range_enforcement.py::test_config_json_rejects_unknown_joint_name PASSED [ 70%]
+tests/test_range_enforcement.py::test_config_json_rejects_string_value PASSED [ 71%]
+tests/test_range_enforcement.py::test_config_json_rejects_center_outside_own_band PASSED [ 71%]
+tests/test_range_enforcement.py::test_config_json_shipped_file_still_loads_cleanly PASSED [ 72%]
+tests/test_range_enforcement.py::test_override_cannot_take_grip_below_1500 PASSED [ 73%]
+tests/test_range_enforcement.py::test_override_cannot_escape_electrical_range[WRIST_ROLL] PASSED [ 73%]
+tests/test_range_enforcement.py::test_override_cannot_escape_electrical_range[WRIST_FLEX] PASSED [ 74%]
+tests/test_range_enforcement.py::test_override_cannot_escape_electrical_range[ELBOW] PASSED [ 75%]
+tests/test_range_enforcement.py::test_override_cannot_escape_electrical_range[SHOULDER_LIFT] PASSED [ 75%]
+tests/test_range_enforcement.py::test_override_cannot_escape_electrical_range[SHOULDER_PAN] PASSED [ 76%]
+tests/test_range_enforcement.py::test_override_grip_within_configured_band_still_succeeds PASSED [ 76%]
+tests/test_range_enforcement.py::test_ramp_intermediates_all_within_electrical_and_effective_bounds PASSED [ 77%]
+tests/test_range_enforcement.py::test_ramp_intermediates_within_range_for_calibrated_style_long_move PASSED [ 78%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_illegal_grip_even_with_valid_token[700] PASSED [ 78%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_illegal_grip_even_with_valid_token[1000] PASSED [ 79%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_illegal_grip_even_with_valid_token[1499] PASSED [ 79%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_illegal_grip_even_with_valid_token[2501] PASSED [ 80%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_illegal_grip_even_with_valid_token[-5] PASSED [ 81%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_illegal_grip_even_with_valid_token[0] PASSED [ 81%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_illegal_grip_non_int[abc] PASSED [ 82%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_illegal_grip_non_int[1000000000.0] PASSED [ 82%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_illegal_grip_non_int[True] PASSED [ 83%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_grip_out_of_range[499-WRIST_ROLL] PASSED [ 84%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_grip_out_of_range[499-WRIST_FLEX] PASSED [ 84%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_grip_out_of_range[499-ELBOW] PASSED [ 85%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_grip_out_of_range[499-SHOULDER_LIFT] PASSED [ 85%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_grip_out_of_range[499-SHOULDER_PAN] PASSED [ 86%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_grip_out_of_range[2501-WRIST_ROLL] PASSED [ 87%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_grip_out_of_range[2501-WRIST_FLEX] PASSED [ 87%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_grip_out_of_range[2501-ELBOW] PASSED [ 88%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_grip_out_of_range[2501-SHOULDER_LIFT] PASSED [ 89%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_grip_out_of_range[2501-SHOULDER_PAN] PASSED [ 89%]
+tests/test_range_enforcement.py::test_transport_backstop_accepts_legal_value PASSED [ 90%]
+tests/test_range_enforcement.py::test_safety_layer_rejects_non_positive_duration[0] PASSED [ 90%]
+tests/test_range_enforcement.py::test_safety_layer_rejects_non_positive_duration[-1] PASSED [ 91%]
+tests/test_range_enforcement.py::test_safety_layer_rejects_non_positive_duration[-1000] PASSED [ 92%]
+tests/test_range_enforcement.py::test_safety_layer_rejects_absurd_duration PASSED [ 92%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_positive_duration[0] PASSED [ 93%]
+tests/test_range_enforcement.py::test_transport_backstop_rejects_non_positive_duration[-1] PASSED [ 93%]
+tests/test_unload_on_exit_and_exception.py::test_unload_on_exit PASSED   [ 94%]
+tests/test_unload_on_exit_and_exception.py::test_unload_on_exception PASSED [ 95%]
+tests/test_unload_on_exit_and_exception.py::test_unload_on_exit_via_arm PASSED [ 95%]
+tests/test_unload_on_exit_and_exception.py::test_unload_on_exception_via_arm PASSED [ 96%]
+tests/test_unload_on_sigint.py::test_unload_on_sigint PASSED             [ 96%]
+tests/test_vision_guard.py::test_vision_guard_detects_no_motion PASSED   [ 97%]
+tests/test_vision_guard.py::test_vision_guard_detects_motion_and_does_not_raise PASSED [ 98%]
+tests/test_vision_guard.py::test_vision_guard_is_a_noop_without_a_camera PASSED [ 98%]
+tests/test_watchdog.py::test_watchdog_unloads_when_idle PASSED           [ 99%]
+tests/test_watchdog.py::test_watchdog_does_not_unload_while_active PASSED [100%]
+
+============================= 164 passed in 20.29s =============================
+```
+
+(RequestsDependencyWarning line from an unrelated globally-installed package
+omitted above, as in the first run; it has no bearing on these results.)
+
+### Still unguarded, and why
+
+1. **`pushButtons.py` at the repository root** — as flagged in the previous
+   session, this is a separate, older script using a different `xarm`
+   library that issues raw absolute servo positions directly, completely
+   bypassing `robohand.config`/`safety`/`protocol`. It remains out of scope:
+   it was not one of the files named in this task (`config.json`,
+   `poses.json`, `sequences.py`, `cli.py`, `arm.py`, `protocol.py`, `sim.py`),
+   and rewriting/deleting an unrelated standalone script was not requested.
+   It should still be deleted, rewritten against `robohand.arm.Arm`, or at
+   minimum marked deprecated/dangerous.
+2. **Judgment call on item 6's exact scope**: the task says "an override may
+   widen up to the *electrical* range for a calibrated joint." No joint
+   currently ships `calibrated: true` in `config.json`, and the override
+   mechanism as implemented widens only to a joint's own *configured*
+   min/max (itself always inside the electrical range), never all the way
+   to the raw electrical range itself. This is the more conservative, safer
+   reading and was not changed, but it is worth flagging explicitly: if a
+   future calibrated joint is meant to be overridable all the way to its
+   electrical limits, that would be a deliberate, separate design change,
+   not something this task's mandate ("never permit anything outside the
+   electrical range... GRIP below 1500") required loosening.
+3. **Shadow/last-commanded state (`~/.robohand/state.json`)**: now validated
+   on load (`arm._load_shadow`) — an illegal or corrupted entry is discarded
+   and logged rather than trusted — but this is a defense-in-depth measure,
+   not a new primary guard; the ramp/effective-bounds checks downstream were
+   already safe against a bad "current" value even before this change.
