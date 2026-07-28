@@ -30,7 +30,12 @@ import dataclasses
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .protocol import MotionToken, NoResponse, require_motion_token
+from .protocol import (
+    MotionToken,
+    NoResponse,
+    assert_targets_within_electrical_range,
+    require_motion_token,
+)
 
 # Plausible mechanical end stops per servo id, narrower than the 500..2500
 # electrical range. These are *not* the configured safe operating band (which is
@@ -168,6 +173,7 @@ class SimTransport:
         token: Optional[MotionToken] = None,
     ) -> None:
         require_motion_token(self, token)
+        assert_targets_within_electrical_range(id_positions, duration_ms)
         entry = {
             "cmd": "MOVE",
             "targets": list(id_positions),

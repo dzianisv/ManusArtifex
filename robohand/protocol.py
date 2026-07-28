@@ -45,6 +45,8 @@ from typing import List, Optional, Sequence
 
 import hid
 
+from . import config
+
 logger = logging.getLogger(__name__)
 
 SIGNATURE = 0x55
@@ -121,6 +123,54 @@ def require_motion_token(transport: object, token: Optional["MotionToken"]) -> N
             "directly is not supported."
         )
     token._redeem(transport)
+
+
+class IllegalServoTarget(config.InvalidPosition):
+    """Last-resort, transport-layer defence in depth (Layer 1's innermost ring).
+
+    Raised by ``move_servos`` on both ``HidTransport`` and ``sim.SimTransport`` if
+    any ``(servo_id, position)`` pair is outside that servo's hardware-legal
+    electrical range (``config.ELECTRICAL_LIMITS``) -- even if it arrived with a
+    valid, single-use ``MotionToken``. Every higher layer (config.json validation,
+    pose/sequence loading, CLI parsing, ``safety.SafetyLayer.move``) should already
+    have rejected an illegal value long before it reaches here, but nothing in this
+    package may assume that and skip this check: this is the check that runs
+    immediately before any bytes are written to the wire.
+    """
+
+
+def assert_targets_within_electrical_range(id_positions: Sequence[tuple], duration_ms: Optional[int] = None) -> None:
+    """Raise ``IllegalServoTarget`` unless every ``(servo_id, position)`` pair is a
+    real integer inside that servo's own electrical range, and ``duration_ms`` (if
+    given) is a sane positive integer. Called by both transports' ``move_servos``
+    before any SERVO_MOVE bytes are ever written.
+    """
+    if duration_ms is not None:
+        if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms <= 0:
+            raise IllegalServoTarget(
+                f"refusing to send SERVO_MOVE: duration_ms must be a positive integer, "
+                f"got {duration_ms!r}."
+            )
+    for servo_id, position in id_positions:
+        if isinstance(servo_id, bool) or not isinstance(servo_id, int) or servo_id not in config.ELECTRICAL_LIMITS:
+            raise IllegalServoTarget(
+                f"refusing to send SERVO_MOVE: servo id {servo_id!r} is not a known "
+                f"joint (known ids: {sorted(config.ELECTRICAL_LIMITS)})."
+            )
+        if isinstance(position, bool) or not isinstance(position, int):
+            raise IllegalServoTarget(
+                f"refusing to send SERVO_MOVE: servo {servo_id} position must be an "
+                f"integer, got {position!r} ({type(position).__name__})."
+            )
+        lo, hi = config.ELECTRICAL_LIMITS[servo_id]
+        if not (lo <= position <= hi):
+            name = config.ID_TO_NAME.get(servo_id, str(servo_id))
+            raise IllegalServoTarget(
+                f"refusing to send SERVO_MOVE: servo {servo_id} ({name}) commanded "
+                f"position {position} is outside its hardware-legal electrical range "
+                f"[{lo}, {hi}]. This is the transport-layer backstop -- it never sends "
+                "a packet outside this range, even with a valid MotionToken."
+            )
 
 
 class NoResponse(RuntimeError):
@@ -290,8 +340,12 @@ class HidTransport:
 
         Requires a ``MotionToken`` minted by ``safety.SafetyLayer`` for this exact
         transport instance -- see ``require_motion_token`` / ``SafetyBypassError``.
+        Also asserts every (servo_id, position) pair is within that servo's
+        electrical range before a single byte is written to the wire -- see
+        ``assert_targets_within_electrical_range`` / ``IllegalServoTarget``.
         """
         require_motion_token(self, token)
+        assert_targets_within_electrical_range(id_positions, duration_ms)
         params = [len(id_positions), duration_ms & 0xFF, (duration_ms >> 8) & 0xFF]
         for servo_id, position in id_positions:
             params.extend([servo_id, position & 0xFF, (position >> 8) & 0xFF])
