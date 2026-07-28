@@ -11,10 +11,10 @@
   "servos": {
     "GRIP": {
       "id": 1,
-      "min": 1200,
-      "max": 1800,
-      "center": 1500,
-      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off.",
+      "min": 1600,
+      "max": 2300,
+      "center": 1950,
+      "comment": "LeArm gripper valid range is 1500..2500 -- NOT 500..2500. Reference lib: `case LeArm: if(servo==1) return clamp(value,1500,2500)`. Lower raw = MORE OPEN; 1500 is the open mechanical stop. Commanding 700 drove past it and splayed the jaws = the 2026-07-28 stall. Band keeps 100 clear of 1500 and 200 clear of 2500.",
       "calibrated": false
     },
     "WRIST_ROLL": {
@@ -71,7 +71,9 @@
     "hold_ms": 2000,
     "idle_unload_ms": 5000,
     "max_continuous_torque_ms": 8000,
-    "comment": "Controller does not answer CMD_MULT_SERVO_POS_READ -> NO position feedback, motion is open loop and stalls cannot be detected by reading position. Therefore limits must stay conservative, every servo must be unloaded (torque off) shortly after each move (hold_ms) and on any idle period (idle_unload_ms), and a hard continuous-torque cap (max_continuous_torque_ms) forces an unload no matter what."
+    "comment": "Controller does not answer CMD_MULT_SERVO_POS_READ -> NO position feedback, motion is open loop and stalls cannot be detected by reading position. Therefore limits must stay conservative, every servo must be unloaded (torque off) shortly after each move (hold_ms) and on any idle period (idle_unload_ms), and a hard continuous-torque cap (max_continuous_torque_ms) forces an unload no matter what.",
+    "gripper_absolute_floor": 1500,
+    "gripper_note": "NEVER command servo 1 (GRIP) below 1500 under any circumstance -- this is documentation only. The real enforcement is the hardcoded ABSOLUTE_MIN_OVERRIDE in robohand/config.py, which cannot be widened by editing this file. robohand.config raises at import time if this value and the hardcoded one disagree."
   },
   "vision": {
     "roi": [0.15, 0.1, 0.7, 0.8],
@@ -83,8 +85,8 @@
   "gripper": {
     "step": 40,
     "ladder_duration_ms": 250,
-    "grip_min_safe": 1220,
-    "grip_max_safe": 1780,
-    "comment": "Hard backstops for the incremental grip ladder. Never crossed regardless of what the vision guard reports."
+    "grip_min_safe": 1600,
+    "grip_max_safe": 2300,
+    "comment": "Hard backstops for the incremental grip ladder -- deliberately identical to GRIP's configured min/max above, never crossed regardless of what the vision guard reports. Lower raw = MORE OPEN for this servo, so the ladder closes by increasing toward grip_max_safe and opens by decreasing toward grip_min_safe. grip_min_safe (1600) still stays 100 clear of the true 1500 mechanical/electrical floor."
   }
 }
