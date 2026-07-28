@@ -327,13 +327,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("move", help="Move one servo or several named joints")
     p.add_argument("--servo", help="Joint name, e.g. GRIP")
-    p.add_argument("--pos", type=int, help="Target position (500-2500)")
-    p.add_argument("--joints", help='JSON object, e.g. \'{"ELBOW":2100,"GRIP":1200}\'')
+    p.add_argument("--pos", type=int, help="Target position, raw servo units (each joint has its own valid range -- see 'robohand doctor'; GRIP is 1500-2500, others are 500-2500)")
+    p.add_argument("--joints", help='JSON object, e.g. \'{"ELBOW":2100,"GRIP":1950}\'')
     p.add_argument("--duration", type=int, default=None, help="Move duration in ms (default 1000)")
     p.add_argument(
         "--override-reason", metavar="REASON", default=None,
         help="Explicitly widen an uncalibrated joint's band to its configured min/max "
-        "for this move (still capped at the 700-2300 global guard). Logged as a WARNING.",
+        "for this move (still capped at the 700-2300 global guard, and at each servo's "
+        "own hardcoded absolute floor/ceiling -- e.g. GRIP can never go below 1500 "
+        "regardless of override). Logged as a WARNING.",
     )
     p.set_defaults(func=cmd_move)
 

@@ -85,11 +85,22 @@ belongs inside `SafetyLayer.move()`, not around it.
    `DEFAULT_MECHANICAL_LIMITS` (used only by the simulator — pick values
    narrower than the electrical 500..2500 range; these are *estimates* for
    testing, not a substitute for real calibration).
-3. That's it for wiring — `config.JOINT_NAMES`, `config.JOINT_LIMITS`,
+3. **Check whether the servo's real electrical range actually matches the
+   generic 500..2500 assumption before trusting the flat global guard.** It
+   may not: GRIP (servo 1) is a LeArm-family gripper servo whose datasheet/
+   reference-firmware range is 1500..2500, not 500..2500 (see
+   `docs/research-hardware.md`) — the flat `GLOBAL_GUARD_MIN`/`MAX` guard in
+   `config.py` would have silently allowed values 800 units past its real
+   floor. If a new joint's part number differs from the arm's main LDX-218
+   joints, look up its real range and add a per-servo entry to
+   `config.ABSOLUTE_MIN_OVERRIDE`/`ABSOLUTE_MAX_OVERRIDE` (hardcoded Python,
+   like the flat guard — never JSON, so it can't be silently widened). Do
+   not assume "generic servo range" without checking.
+4. That's it for wiring — `config.JOINT_NAMES`, `config.JOINT_LIMITS`,
    `config.resolve_servo()`, ramping, calibration checks, and the CLI's
    `--servo`/`--joints` arguments all read the servo map dynamically from
    `config.json`; nothing is hardcoded to the current 6 joints.
-4. Calibrate it for real per `docs/safety.md`'s calibration procedure before
+5. Calibrate it for real per `docs/safety.md`'s calibration procedure before
    setting `calibrated: true` — do this by hand, torque off, with a human
    watching, exactly as for every other joint. There is no automated way to
    discover mechanical limits without either position feedback (which does
