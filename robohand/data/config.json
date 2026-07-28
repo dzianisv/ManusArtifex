@@ -1,0 +1,72 @@
+{
+  "usb": {
+    "vendor_id": "0x0483",
+    "product_id": "0x5750"
+  },
+  "hardware_limits": {
+    "min": 500,
+    "max": 2500,
+    "comment": "Absolute servo range. NEVER command within 200 units of these - end-stop stall risk."
+  },
+  "servos": {
+    "GRIP": {
+      "id": 1,
+      "min": 1200,
+      "max": 1800,
+      "center": 1500,
+      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off.",
+      "calibrated": false
+    },
+    "WRIST_ROLL": {
+      "id": 2,
+      "min": 1200,
+      "max": 1800,
+      "center": 1500,
+      "calibrated": false,
+      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off."
+    },
+    "WRIST_FLEX": {
+      "id": 3,
+      "min": 1200,
+      "max": 1800,
+      "center": 1500,
+      "calibrated": false,
+      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off."
+    },
+    "ELBOW": {
+      "id": 4,
+      "min": 1200,
+      "max": 1800,
+      "center": 1500,
+      "calibrated": false,
+      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off."
+    },
+    "SHOULDER_LIFT": {
+      "id": 5,
+      "min": 1200,
+      "max": 1800,
+      "center": 1500,
+      "calibrated": false,
+      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off."
+    },
+    "SHOULDER_PAN": {
+      "id": 6,
+      "min": 1200,
+      "max": 1800,
+      "center": 1500,
+      "calibrated": false,
+      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off."
+    }
+  },
+  "motion": {
+    "default_duration_ms": 1000,
+    "min_duration_ms": 400,
+    "max_step_per_move": 300,
+    "settle_margin_ms": 100
+  },
+  "safety": {
+    "requires_calibration": true,
+    "open_loop": true,
+    "comment": "Controller does not answer CMD_MULT_SERVO_POS_READ -> NO position feedback, motion is open loop and stalls cannot be detected. Therefore limits must stay conservative and every servo must be unloaded (torque off) when not actively moving."
+  }
+}
