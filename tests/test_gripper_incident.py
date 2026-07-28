@@ -27,8 +27,7 @@ from __future__ import annotations
 
 import pytest
 
-from robohand import config
-from robohand.safety import CalibrationRequired, SafetyLayer
+from robohand.safety import CalibrationRequired, PositionOutOfRange, SafetyLayer
 from robohand.sim import SimTransport
 
 INCIDENT_CLOSE = 700  # the value that actually caused the 2026-07-28 damage
@@ -65,31 +64,46 @@ def test_gripper_cannot_reach_end_stop():
 def test_gripper_cannot_reach_end_stop_even_with_override():
     """Even an explicit, logged override cannot exceed the *configured* band, which
     sits strictly inside the mechanical stop -- the override widens calibration
-    trust, not the physical safety margin.
+    trust, not the physical safety margin. A request that is still outside the
+    configured band is refused outright (never silently redirected to a clamped
+    value) -- 700 is 900 units below GRIP's configured floor (1600) and must raise
+    even with the override, while 2200 sits comfortably inside the configured band
+    and must succeed normally.
     """
     transport = SimTransport()
     safety = SafetyLayer(transport, install_signal_handlers=False)
     try:
-        for incident_target in (INCIDENT_CLOSE, INCIDENT_OPEN):
+        with pytest.raises(PositionOutOfRange):
             safety.move(
-                {"GRIP": incident_target},
+                {"GRIP": INCIDENT_CLOSE},
                 duration_ms=600,
                 wait=False,
                 allow_uncalibrated_override=True,
                 override_reason="test: prove the override still cannot reach the end stop",
             )
+        safety.move(
+            {"GRIP": INCIDENT_OPEN},
+            duration_ms=600,
+            wait=False,
+            allow_uncalibrated_override=True,
+            override_reason="test: prove an in-band override request still succeeds",
+        )
     finally:
         safety.close()
 
+    move_entries = [e for e in transport.log if e.get("cmd") == "MOVE"]
+    assert len(move_entries) == 1, "the refused 700 request must never have reached the transport"
     assert transport.stall_ms_total() == 0
 
 
 def test_gripper_floor_enforced():
     """Direct requests for servo 1 (GRIP) at 700, 1000, and 1499 -- all below the
     true 1500 mechanical/electrical floor -- must never reach the transport as
-    commanded. Without an override they are refused outright (nothing sent at all).
-    With an explicit override they are still clamped up to the configured floor
-    (1600), never anywhere near 1500, let alone below it.
+    commanded, with or without an override. Without an override they are refused
+    as a calibration violation; with an override they are still refused (never
+    silently clamped up to some other value) because they remain below GRIP's own
+    configured floor (1600) -- an override widens which policy band applies, it
+    never fabricates a legal value out of an illegal one.
     """
     below_floor_values = [700, 1000, 1499]
     assert all(v < 1500 for v in below_floor_values)
@@ -107,28 +121,24 @@ def test_gripper_floor_enforced():
     assert move_entries == [], f"expected zero MOVE packets sent, got {move_entries}"
     assert transport.stall_ms_total() == 0
 
-    # -- with an explicit, logged override: clamped, never below the 1500 floor --
+    # -- with an explicit, logged override: STILL refused, nothing sent -----------
     transport2 = SimTransport()
     safety2 = SafetyLayer(transport2, install_signal_handlers=False)
     try:
         for v in below_floor_values:
-            safety2.move(
-                {"GRIP": v},
-                duration_ms=400,
-                wait=False,
-                allow_uncalibrated_override=True,
-                override_reason="test: prove the absolute floor holds even under override",
-            )
+            with pytest.raises(PositionOutOfRange):
+                safety2.move(
+                    {"GRIP": v},
+                    duration_ms=400,
+                    wait=False,
+                    allow_uncalibrated_override=True,
+                    override_reason="test: prove the absolute floor holds even under override",
+                )
     finally:
         safety2.close()
     move_entries2 = [e for e in transport2.log if e.get("cmd") == "MOVE"]
-    assert move_entries2, "expected the override to still send *some* clamped move"
-    for entry in move_entries2:
-        for servo_id, target in entry["targets"]:
-            if servo_id == config.SERVO_IDS["GRIP"]:
-                assert target >= 1500, f"GRIP was sent {target}, below the absolute 1500 floor"
-                assert target >= config.GRIP_MIN_SAFE, (
-                    f"GRIP was sent {target}, below the configured safe floor "
-                    f"{config.GRIP_MIN_SAFE}"
-                )
+    assert move_entries2 == [], (
+        f"an override must never rescue a value below GRIP's own configured floor "
+        f"by clamping it to a different value -- expected zero MOVE packets, got {move_entries2}"
+    )
     assert transport2.stall_ms_total() == 0

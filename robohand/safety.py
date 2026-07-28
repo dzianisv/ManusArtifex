@@ -36,13 +36,22 @@ class SafetyViolation(RuntimeError):
 
 
 class CalibrationRequired(SafetyViolation):
-    """Raised when an uncalibrated joint is asked to move outside its provisional band.
+    """Raised when an uncalibrated joint is asked to move outside its provisional band
+    and no override was supplied. This is a *refusal*, not a clamp: silently
+    redirecting an explicit out-of-band request could give the operator false
+    confidence that their command succeeded.
+    """
 
-    This is a *refusal*, not a clamp: silently redirecting an explicit out-of-band
-    request could give the operator false confidence that their command succeeded.
-    Clamping is still applied deeper in the stack (``config.clamp``) as a pure
-    defense-in-depth backstop, but the primary, user-visible behaviour for this case
-    is to refuse and explain why.
+
+class PositionOutOfRange(SafetyViolation):
+    """Raised when a requested position is outside a joint's *effective* range even
+    though calibration/override policy was satisfied (calibrated joint out of its
+    configured min/max, or an override still outside the joint's configured
+    min/max). Also a refusal, never a clamp -- silently substituting a different
+    value than what was asked for is exactly how the 2026-07-28 incident's wrong
+    raw value went unnoticed. Only internally-generated ramp *intermediate* steps
+    are ever clamped (and that clamp is logged); a user-supplied final target
+    never is.
     """
 
 
@@ -142,7 +151,10 @@ class SafetyLayer:
         if allow_uncalibrated_override and not override_reason:
             raise ValueError("allow_uncalibrated_override requires a non-empty override_reason")
 
-        duration_ms = duration_ms or config.DEFAULT_DURATION_MS
+        if duration_ms is None:
+            duration_ms = config.DEFAULT_DURATION_MS
+        else:
+            duration_ms = config.validate_duration_ms(duration_ms, allow_none=False)
         duration_ms = max(duration_ms, config.MIN_DURATION_MS)
         hold_names = {n.strip().upper() for n in hold} if hold else set()
         guard = vision_guard if vision_guard is not None else self.vision_guard
@@ -151,31 +163,50 @@ class SafetyLayer:
         targets: Dict[str, int] = {}
         starts: Dict[str, int] = {}
         for name, requested in positions.items():
-            key = name.strip().upper()
-            lo, hi = config.effective_bounds(key, allow_uncalibrated_override=allow_uncalibrated_override)
-            requested = int(requested)
-            limit = config.JOINT_LIMITS[key]
-            if not limit.calibrated and not allow_uncalibrated_override and not (lo <= requested <= hi):
-                raise CalibrationRequired(
-                    f"{key} is not calibrated (calibrated: false in config.json) and the "
-                    f"requested position {requested} is outside its provisional band "
-                    f"[{lo}, {hi}] (center {limit.center} +/- {config.PROVISIONAL_BAND}). "
-                    "Refusing to move. Calibrate this joint (see docs/safety.md) or pass "
-                    "an explicit, logged override if you really mean to widen the band."
+            key = config.validate_joint_name(name)
+            if isinstance(requested, bool) or not isinstance(requested, int):
+                raise PositionOutOfRange(
+                    f"{key}: position must be an integer, got {requested!r} "
+                    f"({type(requested).__name__}). Refusing to move."
                 )
-            clamped = max(lo, min(hi, requested))
+            requested = int(requested)
+            lo, hi = config.effective_bounds(key, allow_uncalibrated_override=allow_uncalibrated_override)
+            limit = config.JOINT_LIMITS[key]
+            if not (lo <= requested <= hi):
+                if not limit.calibrated and not allow_uncalibrated_override:
+                    raise CalibrationRequired(
+                        f"{key} is not calibrated (calibrated: false in config.json) and the "
+                        f"requested position {requested} is outside its provisional band "
+                        f"[{lo}, {hi}] (center {limit.center} +/- {config.PROVISIONAL_BAND}). "
+                        "Refusing to move. Calibrate this joint (see docs/safety.md) or pass "
+                        "an explicit, logged override if you really mean to widen the band."
+                    )
+                # Calibrated, or an override was supplied, but the requested value is
+                # STILL outside this joint's own effective range (its configured
+                # min/max, intersected with the absolute guard) -- refuse rather than
+                # silently redirecting to the nearest legal value. A silently
+                # substituted value is exactly how the 2026-07-28 incident's wrong
+                # raw input went unnoticed; an override widens *which policy band*
+                # applies, it never fabricates a legal value out of an illegal one.
+                raise PositionOutOfRange(
+                    f"{key}: requested position {requested} is outside its allowed "
+                    f"range [{lo}, {hi}]"
+                    f"{' even with the override applied' if allow_uncalibrated_override else ''}. "
+                    f"Refusing to move -- choose a value inside [{lo}, {hi}], or "
+                    f"recalibrate {key} in config.json if you believe this range is wrong."
+                )
             abs_lo, abs_hi = config.absolute_bounds(key)
-            if not (abs_lo <= clamped <= abs_hi):
+            if not (abs_lo <= requested <= abs_hi):
                 # Unreachable given effective_bounds always intersects absolute_bounds --
                 # kept as a loud backstop against future regressions. Deliberately
                 # per-servo (not the flat GLOBAL_GUARD_MIN/MAX pair): GRIP's own floor
                 # is 1500, stricter than the generic 700 that is fine for every other
                 # joint (see docs/research-hardware.md).
-                raise OutOfGlobalGuard(f"{key} target {clamped} outside absolute guard "
+                raise OutOfGlobalGuard(f"{key} target {requested} outside absolute guard "
                                         f"[{abs_lo}, {abs_hi}]")
-            targets[key] = clamped
+            targets[key] = requested
             known_current = current.get(key)
-            starts[key] = int(known_current) if known_current is not None else clamped
+            starts[key] = int(known_current) if known_current is not None else requested
 
         if allow_uncalibrated_override:
             entry = {
@@ -202,11 +233,24 @@ class SafetyLayer:
                 id_positions = []
                 for name, target in targets.items():
                     start = starts[name]
-                    pos = int(round(start + (target - start) * frac))
+                    raw_pos = int(round(start + (target - start) * frac))
+                    # Ramp intermediates are internally generated (interpolated), not
+                    # user-supplied -- clamping here is the one place in this module
+                    # that is allowed, per design, and only as a defense-in-depth
+                    # backstop: a linear interpolation between two already-validated
+                    # in-range points is mathematically guaranteed to stay in range,
+                    # so this should never actually change anything. If it ever does,
+                    # log loudly rather than silently swallowing it.
                     lo, hi = config.effective_bounds(name, allow_uncalibrated_override=allow_uncalibrated_override)
-                    pos = max(lo, min(hi, pos))
                     abs_lo, abs_hi = config.absolute_bounds(name)
-                    pos = max(abs_lo, min(abs_hi, pos))
+                    pos = max(abs_lo, min(abs_hi, max(lo, min(hi, raw_pos))))
+                    if pos != raw_pos:
+                        logger.warning(
+                            "ramp intermediate for %s clamped from %s to %s (bounds "
+                            "[%s, %s] / absolute [%s, %s]) -- this should be "
+                            "unreachable for a legal start/target pair; investigate.",
+                            name, raw_pos, pos, lo, hi, abs_lo, abs_hi,
+                        )
                     id_positions.append((config.resolve_servo(name), pos))
                 step_duration = max(config.MIN_DURATION_MS, duration_ms // steps)
                 self._transport.move_servos(id_positions, step_duration, token=self._mint_token())
