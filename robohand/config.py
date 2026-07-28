@@ -10,64 +10,216 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Dict, NamedTuple
+from typing import Dict, NamedTuple, Tuple
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = PACKAGE_DIR / "data" / "config.json"
 DEFAULT_POSES_PATH = PACKAGE_DIR / "data" / "poses.json"
 
-# Absolute *electrical* hardware safety rail (the physical PWM range the servos
-# accept at all). No command may ever be sent outside this range, regardless of
-# what a config file or CLI argument requests.
-HARD_MIN = 500
-HARD_MAX = 2500
 
-# Global absolute guard (Layer 1, outermost ring). We stay 200 units clear of both
-# electrical ends unconditionally -- this is NOT configurable via config.json on
-# purpose: a bad edit to the JSON file must not be able to widen this rail. Every
-# other bound (per-joint config min/max, provisional band, grip backstops) is
-# intersected with this one before anything is ever sent to a transport.
-#
-# IMPORTANT: this pair is a reasonable default for ordinary hobby servos across
-# the full 500..2500 electrical range, but it is NOT sufficient on its own for
-# every joint. The 2026-07-28 incident (root-caused after the fact, see
-# docs/research-hardware.md) showed that GRIP (servo id 1) is a LeArm-family
-# gripper servo whose *own* valid electrical range is 1500..2500, not 500..2500
-# -- 700 is comfortably inside this global pair yet is 800 units past GRIP's real
-# floor. A single global pair cannot express that. See ABSOLUTE_MIN_OVERRIDE /
-# ABSOLUTE_MAX_OVERRIDE below, which layer stricter, per-servo rails on top of
-# this one wherever a servo's own hardware disagrees with the generic default.
-GLOBAL_GUARD_MIN = 700
-GLOBAL_GUARD_MAX = 2300
+class ConfigError(ValueError):
+    """Raised when config.json (or an equivalent override file) is structurally
+    invalid: an inverted min/max, a range that widens past a servo's electrical
+    limit, a center outside its own band, an unknown joint name, a non-integer
+    value, or a missing required key. Always names the offending key and value.
+    """
 
-# Per-servo absolute rails that are STRICTER than GLOBAL_GUARD_MIN/MAX for that
-# specific servo model. Like GLOBAL_GUARD_MIN/MAX, these are hardcoded in Python
-# -- not read from config.json -- for the same reason: editing the JSON config
-# must never be able to widen a true electrical/mechanical limit. `absolute_bounds`
-# below intersects these with GLOBAL_GUARD_MIN/MAX, so the effective floor/ceiling
-# for a joint is always the *tighter* of the two.
+
+class InvalidPosition(ValueError):
+    """Raised whenever a requested joint position, joint name, or duration is not
+    a legal value -- used uniformly by CLI parsing, pose/sequence file loading,
+    pose --save/teach write paths, and the direct API. This is the "reject, don't
+    silently clamp" half of the safety design: anything a human or a file supplied
+    that is out of range is refused here, before it goes anywhere near a transport.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Single source of truth: hardware wiring and electrical limits.
 #
+# CANONICAL_JOINTS fixes which joint name is wired to which numeric servo id --
+# this is a physical fact about the arm, not a policy choice, so it is hardcoded
+# here and NOT settable via config.json. A config.json that tries to reassign a
+# joint's id (e.g. claim GRIP is id 2) is rejected at load time (see
+# ``_validate_servo_spec``) rather than silently trusted.
+#
+# ELECTRICAL_LIMITS is the *only* place the servos' raw hardware-legal PWM ranges
+# are allowed to be defined, keyed by canonical servo id. Every other bound in
+# this module (GLOBAL_GUARD_MIN/MAX, per-joint configured min/max, the
+# provisional band, the grip ladder backstops) is derived from this table and
+# may only ever be equal to or narrower than it -- nothing in this package may
+# widen past these numbers, from any entry point, ever.
+# ---------------------------------------------------------------------------
+CANONICAL_JOINTS: Dict[str, int] = {
+    "GRIP": 1,
+    "WRIST_ROLL": 2,
+    "WRIST_FLEX": 3,
+    "ELBOW": 4,
+    "SHOULDER_LIFT": 5,
+    "SHOULDER_PAN": 6,
+}
+
 # GRIP (servo id 1): confirmed by the reference xArmServoController firmware
 # (`case LeArm: if (servo == 1) return clamp(value, 1500, 2500);`) and
 # independently by a LeArm owner (ccourson/Hiwonder-xArm1S#5). Lower raw = MORE
 # OPEN; 1500 is the true open mechanical/electrical stop. The 2026-07-28 incident
-# command (close_grip=700) was 800 units below this floor -- this override is
-# what makes that specific failure mode structurally impossible even if every
-# other layer (config.json bounds, calibration flag, provisional band) were
-# somehow misconfigured back to the old, wrong 500..2500 assumption.
-ABSOLUTE_MIN_OVERRIDE: Dict[str, int] = {
-    "GRIP": 1500,
+# command (close_grip=700) was 800 units below this floor. Every other joint uses
+# the generic 500..2500 electrical range for this controller/servo family.
+ELECTRICAL_LIMITS: Dict[int, Tuple[int, int]] = {
+    1: (1500, 2500),  # GRIP
+    2: (500, 2500),  # WRIST_ROLL
+    3: (500, 2500),  # WRIST_FLEX
+    4: (500, 2500),  # ELBOW
+    5: (500, 2500),  # SHOULDER_LIFT
+    6: (500, 2500),  # SHOULDER_PAN
 }
-ABSOLUTE_MAX_OVERRIDE: Dict[str, int] = {}
+
+# Backward-compatible aliases: the flattest possible electrical envelope across
+# every servo. Only used for the config.json `hardware_limits` documentation
+# tripwire below -- never used to compute a per-joint bound (ELECTRICAL_LIMITS is
+# always used for that, per-servo, so GRIP's tighter 1500 floor can never be lost
+# by accidentally falling back to these flat numbers).
+HARD_MIN = min(lo for lo, _ in ELECTRICAL_LIMITS.values())
+HARD_MAX = max(hi for _, hi in ELECTRICAL_LIMITS.values())
+
+# Global conservative *policy* ring (Layer 1, outermost operational ring). We stay
+# clear of both electrical ends unconditionally while joints are uncalibrated --
+# this is NOT configurable via config.json on purpose: a bad edit to the JSON file
+# must not be able to widen this rail. It is intersected with each servo's own
+# ELECTRICAL_LIMITS (see ``absolute_bounds``) so a joint whose electrical floor is
+# already stricter than this ring (GRIP) keeps its own, tighter floor.
+GLOBAL_GUARD_MIN = 700
+GLOBAL_GUARD_MAX = 2300
+
+
+def electrical_bounds(name: str) -> Tuple[int, int]:
+    """The hardware-legal electrical range for this joint -- the outermost limit
+    that can never be widened, configured, or overridden past, from any entry
+    point in this package (config.json, poses, sequences, the CLI, the direct
+    API, or the transport layer itself). Looked up from ``ELECTRICAL_LIMITS`` by
+    this joint's fixed ``CANONICAL_JOINTS`` servo id.
+    """
+    if name not in CANONICAL_JOINTS:
+        raise InvalidPosition(f"unknown joint {name!r}. Known joints: {sorted(CANONICAL_JOINTS)}")
+    return ELECTRICAL_LIMITS[CANONICAL_JOINTS[name]]
 
 
 def absolute_bounds(name: str) -> tuple:
-    """The strictest hardcoded floor/ceiling for this joint: GLOBAL_GUARD_MIN/MAX
-    intersected with any per-servo override. Nothing in config.json can widen this.
+    """The strictest hardcoded floor/ceiling for this joint: ``GLOBAL_GUARD_MIN/MAX``
+    intersected with this joint's own ``ELECTRICAL_LIMITS``. Nothing in config.json
+    can widen this -- it is the ceiling every configured min/max, provisional band,
+    and override is measured against.
     """
-    lo = max(GLOBAL_GUARD_MIN, ABSOLUTE_MIN_OVERRIDE.get(name, GLOBAL_GUARD_MIN))
-    hi = min(GLOBAL_GUARD_MAX, ABSOLUTE_MAX_OVERRIDE.get(name, GLOBAL_GUARD_MAX))
+    elec_lo, elec_hi = electrical_bounds(name)
+    lo = max(GLOBAL_GUARD_MIN, elec_lo)
+    hi = min(GLOBAL_GUARD_MAX, elec_hi)
     return lo, hi
+
+
+def validate_joint_name(name) -> str:
+    """Normalize and validate a joint name. Raises ``InvalidPosition`` if ``name``
+    is not a string, or does not match one of the six known canonical joints.
+    """
+    if not isinstance(name, str):
+        raise InvalidPosition(f"joint name must be a string, got {name!r} ({type(name).__name__}).")
+    key = name.strip().upper()
+    if key not in CANONICAL_JOINTS:
+        raise InvalidPosition(f"unknown joint {name!r}. Known joints: {sorted(CANONICAL_JOINTS)}.")
+    return key
+
+
+def validate_position_value(name: str, value) -> int:
+    """Validate a single requested position is a real ``int`` inside ``name``'s
+    hardware-legal electrical range. This is the absolute floor every entry point
+    (CLI, pose file, sequence file, ``pose --save``/``teach``, direct API) must
+    apply before a position is considered further -- it does NOT apply the
+    calibration/provisional-band *policy* (that is ``safety.SafetyLayer``'s job);
+    it only rejects values that are illegal on this hardware no matter what.
+    """
+    key = validate_joint_name(name)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidPosition(
+            f"{key}: position must be an integer (raw PWM microseconds), got "
+            f"{value!r} ({type(value).__name__}). Non-integer/float/string positions "
+            "are never accepted."
+        )
+    lo, hi = electrical_bounds(key)
+    if not (lo <= value <= hi):
+        raise InvalidPosition(
+            f"{key}: position {value} is outside its hardware-legal electrical range "
+            f"[{lo}, {hi}]. This is {key}'s own physical servo limit and can never be "
+            f"widened by any config, override, or flag -- choose a value inside "
+            f"[{lo}, {hi}]."
+        )
+    return value
+
+
+def validate_positions(positions) -> Dict[str, int]:
+    """Validate a ``{joint_name: position}`` mapping. Returns a normalized dict
+    (uppercased keys, plain ``int`` values). Raises ``InvalidPosition`` naming the
+    first offending entry. This is the single choke point used by CLI parsing,
+    pose file loading, sequence file loading, and ``pose --save``/``teach`` --
+    every entry point that accepts raw positions from outside the safety layer's
+    own calibration policy.
+    """
+    if not isinstance(positions, dict) or not positions:
+        raise InvalidPosition(
+            f"positions must be a non-empty object of {{JOINT: position}}, got {positions!r}."
+        )
+    validated: Dict[str, int] = {}
+    for name, value in positions.items():
+        key = validate_joint_name(name)
+        validated[key] = validate_position_value(key, value)
+    return validated
+
+
+# Sanity cap on any single move/step duration. Not a hardware limit -- guards
+# against a pathological input (e.g. a stray ``1e9``, or a negative value) causing
+# a divide-by-zero downstream, an effectively-instant slam (duration <= 0), or a
+# multi-hour sleep that looks like a hang.
+MAX_REASONABLE_DURATION_MS = 60_000
+
+
+def validate_duration_ms(value, *, allow_none: bool = True):
+    """Validate a duration in milliseconds. ``None`` is allowed (caller substitutes
+    a default) unless ``allow_none=False``. Otherwise ``value`` must be a positive
+    ``int`` no larger than ``MAX_REASONABLE_DURATION_MS``.
+    """
+    if value is None:
+        if allow_none:
+            return None
+        raise InvalidPosition("duration_ms is required.")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidPosition(
+            f"duration_ms must be an integer, got {value!r} ({type(value).__name__})."
+        )
+    if value <= 0:
+        raise InvalidPosition(
+            f"duration_ms must be a positive integer, got {value} (non-positive durations "
+            "would be an instant slam or a divide-by-zero)."
+        )
+    if value > MAX_REASONABLE_DURATION_MS:
+        raise InvalidPosition(
+            f"duration_ms {value} exceeds the sanity cap of {MAX_REASONABLE_DURATION_MS}ms."
+        )
+    return value
+
+
+def _require_int(value, key_path: str):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(
+            f"config.json {key_path} must be an integer, got {value!r} ({type(value).__name__})."
+        )
+    return value
+
+
+def _require_positive_int(value, key_path: str, *, allow_zero: bool = False) -> int:
+    value = _require_int(value, key_path)
+    if allow_zero and value < 0:
+        raise ConfigError(f"config.json {key_path} must be >= 0, got {value}.")
+    if not allow_zero and value <= 0:
+        raise ConfigError(f"config.json {key_path} must be a positive integer, got {value}.")
+    return value
 
 
 # Width of the provisional (uncalibrated-joint) safety band, in raw units either
@@ -100,54 +252,121 @@ _CONFIG = load_config()
 VENDOR_ID = int(_CONFIG["usb"]["vendor_id"], 16)
 PRODUCT_ID = int(_CONFIG["usb"]["product_id"], 16)
 
-_hw = _CONFIG.get("hardware_limits", {})
-CONFIG_HARD_MIN = max(HARD_MIN, int(_hw.get("min", HARD_MIN)))
-CONFIG_HARD_MAX = min(HARD_MAX, int(_hw.get("max", HARD_MAX)))
-
 _safety_raw = _CONFIG.get("safety", {})
 _json_gripper_floor = _safety_raw.get("gripper_absolute_floor")
-if _json_gripper_floor is not None and int(_json_gripper_floor) != ABSOLUTE_MIN_OVERRIDE.get("GRIP"):
+_grip_electrical_floor = ELECTRICAL_LIMITS[CANONICAL_JOINTS["GRIP"]][0]
+if _json_gripper_floor is not None and _require_int(_json_gripper_floor, "safety.gripper_absolute_floor") != _grip_electrical_floor:
     # This is a deliberate tripwire, not defensive paranoia: safety.gripper_absolute_floor
     # in config.json is documentation for humans reading the file, NOT the enforcement
-    # mechanism (ABSOLUTE_MIN_OVERRIDE above is). If someone edits one without the other,
+    # mechanism (ELECTRICAL_LIMITS above is). If someone edits one without the other,
     # that is exactly the kind of silent drift that must fail loudly instead of quietly
     # using whichever value happened to win.
-    raise ValueError(
+    raise ConfigError(
         "config.json safety.gripper_absolute_floor "
         f"({_json_gripper_floor}) disagrees with the hardcoded "
-        f"ABSOLUTE_MIN_OVERRIDE['GRIP'] ({ABSOLUTE_MIN_OVERRIDE.get('GRIP')}) in "
+        f"ELECTRICAL_LIMITS floor for GRIP ({_grip_electrical_floor}) in "
         "robohand/config.py. These must always agree -- the JSON value is "
         "documentation only; the Python constant is what is actually enforced. "
         "Fix config.json or config.py so they match."
     )
 
+_hw = _CONFIG.get("hardware_limits", {})
+if "min" in _hw and _require_int(_hw["min"], "hardware_limits.min") != HARD_MIN:
+    raise ConfigError(
+        f"config.json hardware_limits.min ({_hw['min']}) disagrees with the hardcoded "
+        f"floor across ELECTRICAL_LIMITS ({HARD_MIN}). This field is documentation only "
+        "-- fix config.json or robohand/config.py so they match."
+    )
+if "max" in _hw and _require_int(_hw["max"], "hardware_limits.max") != HARD_MAX:
+    raise ConfigError(
+        f"config.json hardware_limits.max ({_hw['max']}) disagrees with the hardcoded "
+        f"ceiling across ELECTRICAL_LIMITS ({HARD_MAX}). This field is documentation "
+        "only -- fix config.json or robohand/config.py so they match."
+    )
+
+
+def _validate_servo_spec(name: str, spec: dict) -> JointLimit:
+    """Validate one ``servos.<name>`` entry from config.json. Raises ``ConfigError``
+    naming the exact offending key on any of: an unknown joint name, a servo id
+    that disagrees with the fixed hardware wiring, a missing/non-integer min or
+    max, an inverted min/max, a min/max that widens past this joint's electrical
+    range, a non-integer or out-of-band center, or a non-bool ``calibrated`` flag.
+    """
+    if name not in CANONICAL_JOINTS:
+        raise ConfigError(
+            f"config.json servos: unknown joint name {name!r}. Known joints: "
+            f"{sorted(CANONICAL_JOINTS)}. Remove or rename this entry in config.json."
+        )
+    servo_id = CANONICAL_JOINTS[name]
+    if "id" in spec and _require_int(spec["id"], f"servos.{name}.id") != servo_id:
+        raise ConfigError(
+            f"config.json servos.{name}.id ({spec['id']}) disagrees with the fixed "
+            f"hardware wiring id ({servo_id}) for {name}. The joint-name-to-servo-id "
+            "mapping is fixed in robohand/config.py (CANONICAL_JOINTS) and physically "
+            f"wired -- it cannot be changed via config.json. Fix or remove servos.{name}.id."
+        )
+    if "min" not in spec or "max" not in spec:
+        raise ConfigError(f"config.json servos.{name} is missing required key 'min' and/or 'max'.")
+    lo_raw = _require_int(spec["min"], f"servos.{name}.min")
+    hi_raw = _require_int(spec["max"], f"servos.{name}.max")
+    if lo_raw > hi_raw:
+        raise ConfigError(
+            f"config.json servos.{name}: min ({lo_raw}) > max ({hi_raw}) -- inverted "
+            f"range. Fix servos.{name}.min/max in config.json."
+        )
+    elec_lo, elec_hi = ELECTRICAL_LIMITS[servo_id]
+    if lo_raw < elec_lo or hi_raw > elec_hi:
+        raise ConfigError(
+            f"config.json servos.{name} range [{lo_raw}, {hi_raw}] exceeds {name}'s "
+            f"hardware-legal electrical range [{elec_lo}, {elec_hi}]. Narrow "
+            f"servos.{name}.min/max in config.json to stay inside the electrical range "
+            "-- a config file must never be able to widen a joint past its hardware limit."
+        )
+    guard_lo, guard_hi = absolute_bounds(name)
+    lo = max(guard_lo, lo_raw)
+    hi = min(guard_hi, hi_raw)
+    if "center" in spec:
+        center = _require_int(spec["center"], f"servos.{name}.center")
+        if not (lo_raw <= center <= hi_raw):
+            raise ConfigError(
+                f"config.json servos.{name}.center ({center}) is outside its own "
+                f"configured band [{lo_raw}, {hi_raw}]. Fix servos.{name}.center."
+            )
+    else:
+        center = (lo + hi) // 2
+    calibrated = spec.get("calibrated", False)
+    if not isinstance(calibrated, bool):
+        raise ConfigError(
+            f"config.json servos.{name}.calibrated must be true or false, got {calibrated!r}."
+        )
+    return JointLimit(servo_id=servo_id, min=lo, max=hi, center=center, calibrated=calibrated)
+
+
+_servos_raw = _CONFIG.get("servos", {})
+_missing_joints = sorted(set(CANONICAL_JOINTS) - set(_servos_raw))
+if _missing_joints:
+    raise ConfigError(f"config.json servos is missing required joint(s): {_missing_joints}.")
+
 JOINT_LIMITS: Dict[str, JointLimit] = {}
-SERVO_IDS: Dict[str, int] = {}
-ID_TO_NAME: Dict[int, str] = {}
+SERVO_IDS: Dict[str, int] = dict(CANONICAL_JOINTS)
+ID_TO_NAME: Dict[int, str] = {v: k for k, v in CANONICAL_JOINTS.items()}
 
-for name, spec in _CONFIG["servos"].items():
-    abs_lo, abs_hi = absolute_bounds(name)
-    lo = max(CONFIG_HARD_MIN, abs_lo, int(spec["min"]))
-    hi = min(CONFIG_HARD_MAX, abs_hi, int(spec["max"]))
-    center = int(spec.get("center", (lo + hi) // 2))
-    calibrated = bool(spec.get("calibrated", False))
-    JOINT_LIMITS[name] = JointLimit(servo_id=int(spec["id"]), min=lo, max=hi, center=center, calibrated=calibrated)
-    SERVO_IDS[name] = int(spec["id"])
-    ID_TO_NAME[int(spec["id"])] = name
+for _name, _spec in _servos_raw.items():
+    JOINT_LIMITS[_name] = _validate_servo_spec(_name, _spec)
 
-JOINT_NAMES = list(JOINT_LIMITS.keys())
+JOINT_NAMES = list(CANONICAL_JOINTS)
 
 _motion = _CONFIG.get("motion", {})
-DEFAULT_DURATION_MS = int(_motion.get("default_duration_ms", 1000))
-MIN_DURATION_MS = int(_motion.get("min_duration_ms", 400))
-MAX_STEP_PER_MOVE = int(_motion.get("max_step_per_move", 400))
-SETTLE_MARGIN_MS = int(_motion.get("settle_margin_ms", 100))
+DEFAULT_DURATION_MS = _require_positive_int(_motion.get("default_duration_ms", 1000), "motion.default_duration_ms")
+MIN_DURATION_MS = _require_positive_int(_motion.get("min_duration_ms", 400), "motion.min_duration_ms")
+MAX_STEP_PER_MOVE = _require_positive_int(_motion.get("max_step_per_move", 400), "motion.max_step_per_move")
+SETTLE_MARGIN_MS = _require_positive_int(_motion.get("settle_margin_ms", 100), "motion.settle_margin_ms", allow_zero=True)
 
 _safety = _safety_raw
-PROVISIONAL_BAND = int(_safety.get("provisional_band", DEFAULT_PROVISIONAL_BAND))
-HOLD_MS = int(_safety.get("hold_ms", 2000))
-IDLE_UNLOAD_MS = int(_safety.get("idle_unload_ms", 5000))
-MAX_CONTINUOUS_TORQUE_MS = int(_safety.get("max_continuous_torque_ms", 8000))
+PROVISIONAL_BAND = _require_positive_int(_safety.get("provisional_band", DEFAULT_PROVISIONAL_BAND), "safety.provisional_band")
+HOLD_MS = _require_positive_int(_safety.get("hold_ms", 2000), "safety.hold_ms", allow_zero=True)
+IDLE_UNLOAD_MS = _require_positive_int(_safety.get("idle_unload_ms", 5000), "safety.idle_unload_ms")
+MAX_CONTINUOUS_TORQUE_MS = _require_positive_int(_safety.get("max_continuous_torque_ms", 8000), "safety.max_continuous_torque_ms")
 
 _vision = _CONFIG.get("vision", {})
 VISION_ROI = tuple(_vision.get("roi", [0.15, 0.1, 0.7, 0.8]))
@@ -156,22 +375,27 @@ VISION_MIN_CHANGED_PIXELS = int(_vision.get("min_changed_pixels", 150))
 VISION_BLUR_KSIZE = int(_vision.get("blur_ksize", 5))
 
 _gripper = _CONFIG.get("gripper", {})
-_grip_abs_lo, _grip_abs_hi = absolute_bounds("GRIP") if "GRIP" in JOINT_LIMITS else (GLOBAL_GUARD_MIN, GLOBAL_GUARD_MAX)
-GRIP_STEP = int(_gripper.get("step", 40))
-GRIP_LADDER_DURATION_MS = int(_gripper.get("ladder_duration_ms", 250))
-GRIP_MIN_SAFE = int(_gripper.get("grip_min_safe", JOINT_LIMITS["GRIP"].min if "GRIP" in JOINT_LIMITS else _grip_abs_lo))
-GRIP_MAX_SAFE = int(_gripper.get("grip_max_safe", JOINT_LIMITS["GRIP"].max if "GRIP" in JOINT_LIMITS else _grip_abs_hi))
+_grip_abs_lo, _grip_abs_hi = absolute_bounds("GRIP")
+GRIP_STEP = _require_positive_int(_gripper.get("step", 40), "gripper.step")
+GRIP_LADDER_DURATION_MS = _require_positive_int(_gripper.get("ladder_duration_ms", 250), "gripper.ladder_duration_ms")
+GRIP_MIN_SAFE = _require_int(_gripper.get("grip_min_safe", JOINT_LIMITS["GRIP"].min), "gripper.grip_min_safe")
+GRIP_MAX_SAFE = _require_int(_gripper.get("grip_max_safe", JOINT_LIMITS["GRIP"].max), "gripper.grip_max_safe")
 if GRIP_MIN_SAFE < _grip_abs_lo:
-    raise ValueError(
+    raise ConfigError(
         f"config.json gripper.grip_min_safe ({GRIP_MIN_SAFE}) is below the absolute "
         f"GRIP floor ({_grip_abs_lo}). This backstop must never be looser than the "
         "hardcoded absolute rail -- fix gripper.grip_min_safe in config.json."
     )
 if GRIP_MAX_SAFE > _grip_abs_hi:
-    raise ValueError(
+    raise ConfigError(
         f"config.json gripper.grip_max_safe ({GRIP_MAX_SAFE}) is above the absolute "
         f"GRIP ceiling ({_grip_abs_hi}). This backstop must never be looser than the "
         "hardcoded absolute rail -- fix gripper.grip_max_safe in config.json."
+    )
+if GRIP_MIN_SAFE > GRIP_MAX_SAFE:
+    raise ConfigError(
+        f"config.json gripper.grip_min_safe ({GRIP_MIN_SAFE}) > gripper.grip_max_safe "
+        f"({GRIP_MAX_SAFE}) -- inverted range. Fix config.json."
     )
 
 

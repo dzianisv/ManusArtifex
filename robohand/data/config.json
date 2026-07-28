@@ -73,7 +73,7 @@
     "max_continuous_torque_ms": 8000,
     "comment": "Controller does not answer CMD_MULT_SERVO_POS_READ -> NO position feedback, motion is open loop and stalls cannot be detected by reading position. Therefore limits must stay conservative, every servo must be unloaded (torque off) shortly after each move (hold_ms) and on any idle period (idle_unload_ms), and a hard continuous-torque cap (max_continuous_torque_ms) forces an unload no matter what.",
     "gripper_absolute_floor": 1500,
-    "gripper_note": "NEVER command servo 1 (GRIP) below 1500 under any circumstance -- this is documentation only. The real enforcement is the hardcoded ABSOLUTE_MIN_OVERRIDE in robohand/config.py, which cannot be widened by editing this file. robohand.config raises at import time if this value and the hardcoded one disagree."
+    "gripper_note": "NEVER command servo 1 (GRIP) below 1500 under any circumstance -- this is documentation only. The real enforcement is the hardcoded ELECTRICAL_LIMITS[1] floor in robohand/config.py, which cannot be widened by editing this file. robohand.config raises at import time if this value and the hardcoded one disagree."
   },
   "vision": {
     "roi": [0.15, 0.1, 0.7, 0.8],
