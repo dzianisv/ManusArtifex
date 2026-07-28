@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: robohand
+Version: 0.1.0
+Summary: Control library and CLI for the Hiwonder/LewanSoul LeArm (xArm 1S, LSC-6) 6-DOF robotic arm
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: hidapi>=0.14

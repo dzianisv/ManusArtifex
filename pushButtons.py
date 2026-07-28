@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
+"""DISABLED legacy script -- kept only as a record of the original servo map.
 
+This script drove the arm through the raw `xarm` library, bypassing every
+safety layer in the `robohand` package. It commands ELBOW to 2600, which is
+past the servo's 2500 electrical maximum and well past its mechanical stop --
+exactly the class of command that stalled the gripper on 2026-07-28 and forced
+the operator to cut power.
+
+Use the `robohand` CLI instead. See docs/safety.md.
+"""
+
+import sys
+
+sys.exit(
+    "pushButtons.py is DISABLED: it bypasses all safety limits and commands "
+    "ELBOW to 2600 (past the 2500 maximum). Use the `robohand` CLI. "
+    "See docs/safety.md."
+)
+
+# ---------------------------------------------------------------------------
+# Historical reference only -- the verified servo map. Do not re-enable.
+#
+#   1=GRIP  2=WRIST_ROLL  3=WRIST_FLEX  4=ELBOW  5=SHOULDER_LIFT  6=SHOULDER_PAN
+#
+# Note GRIP is special: its valid range is 1500..2500, not 500..2500.
+# ---------------------------------------------------------------------------
 
 # https://www.youtube.com/watch?v=Qh7lPC_Qf74&list=PLFbzd0m6AcmIRtTkAc3stBz77wRqlpMFD&index=11
 import xarm
