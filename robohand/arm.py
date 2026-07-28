@@ -137,11 +137,27 @@ class Arm:
         try:
             with open(path) as f:
                 saved = json.load(f)
+            if not isinstance(saved, dict):
+                logger.warning("shadow state file %s is not a JSON object; ignoring it.", path)
+                return
             for name in config.JOINT_NAMES:
-                if name in saved:
-                    self._shadow[name] = saved[name]
-        except (json.JSONDecodeError, OSError):
-            pass
+                if name not in saved:
+                    continue
+                value = saved[name]
+                if value is None:
+                    continue
+                try:
+                    self._shadow[name] = config.validate_position_value(name, value)
+                except config.InvalidPosition as e:
+                    # A hand-corrupted or stale shadow-state file must never seed an
+                    # illegal "current" position into ramp interpolation -- discard
+                    # the bad entry (treated as "unknown") and log loudly rather
+                    # than trusting it silently.
+                    logger.warning(
+                        "discarding illegal shadow position for %s from %s: %s", name, path, e
+                    )
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("could not read shadow state file %s: %s", path, e)
 
     def _save_shadow(self) -> None:
         if self.dry_run:
@@ -328,7 +344,14 @@ class Arm:
         """
         if direction not in ("close", "open"):
             raise ValueError("direction must be 'close' or 'open'")
-        step = abs(step if step is not None else config.GRIP_STEP)
+        if step is None:
+            step = config.GRIP_STEP
+        elif not isinstance(step, int) or isinstance(step, bool) or step <= 0:
+            raise ValueError(
+                f"--step must be a positive integer, got {step!r}. Refusing to guess "
+                "what a negative or zero step size means -- specify a positive "
+                "increment; direction (open/close) already controls which way it moves."
+            )
         duration_ms = duration_ms or config.GRIP_LADDER_DURATION_MS
         # GRIP (servo 1) is a LeArm gripper servo where LOWER raw = MORE OPEN (see
         # docs/research-hardware.md). So "close" increases the raw value toward

@@ -71,15 +71,25 @@ def cmd_pos(args: argparse.Namespace) -> int:
 
 
 def _parse_joints(raw: str) -> dict:
-    data = json.loads(raw)
-    return {k.upper(): int(v) for k, v in data.items()}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise config.InvalidPosition(
+            f"--joints must be valid JSON, e.g. '{{\"ELBOW\":2100,\"GRIP\":1950}}'. "
+            f"Parse error: {e}"
+        ) from e
+    if not isinstance(data, dict):
+        raise config.InvalidPosition(
+            f"--joints must be a JSON object of {{JOINT: position}}, got {data!r}."
+        )
+    return config.validate_positions(data)
 
 
 def cmd_move(args: argparse.Namespace) -> int:
     if args.joints:
         targets = _parse_joints(args.joints)
     elif args.servo and args.pos is not None:
-        targets = {args.servo.upper(): args.pos}
+        targets = config.validate_positions({args.servo.upper(): args.pos})
     else:
         print("error: provide either --joints '{...}' or --servo NAME --pos N", file=sys.stderr)
         return 2
@@ -175,7 +185,20 @@ def cmd_teach(args: argparse.Namespace) -> int:
             for name in names:
                 raw = input(f"  {name} [skip]> ").strip()
                 if raw:
-                    positions[name] = config.clamp(name, int(raw))
+                    try:
+                        value = int(raw)
+                    except ValueError:
+                        print(
+                            f"error: {name}: position must be an integer, got {raw!r}. "
+                            "Nothing saved.",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    try:
+                        positions[name] = config.validate_position_value(name, value)
+                    except config.InvalidPosition as e:
+                        print(f"error: {e} Nothing saved.", file=sys.stderr)
+                        return 1
             if not positions:
                 print("No positions entered; nothing saved.", file=sys.stderr)
                 return 1
@@ -398,6 +421,18 @@ def main(argv: Optional[list] = None) -> int:
     except SafetyViolation as e:
         print(f"error: safety violation -- {e}", file=sys.stderr)
         return 1
+    except (config.InvalidPosition, config.ConfigError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    except json.JSONDecodeError as e:
+        print(f"error: invalid JSON -- {e}", file=sys.stderr)
+        return 2
+    except KeyError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     except NoResponse as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
