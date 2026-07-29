@@ -120,6 +120,17 @@ class CalibrationSettings:
     #: ROI, so a value below 2 is refused.
     confirmations: int = 2
 
+    #: Size of the reliability burst run before any stop is recorded: an oscillation
+    #: between two positions the joint has already been watched to reach, so every
+    #: move in the burst is known-real motion and every miss is provably the
+    #: observer's error. Six moves make an observer that misses half of all real
+    #: motion fail ~89% of the time, while an observer missing ~1 in 7 passes.
+    verification_moves: int = 6
+
+    #: Misses tolerated within that burst. One absorbs a single unlucky frame; more
+    #: than one means the observer is not good enough to infer a stop from silence.
+    max_verification_misses: int = 1
+
     #: Defensive backstop; the search normally terminates at the joint's own bound.
     max_steps_per_direction: int = 64
 
@@ -152,6 +163,14 @@ class CalibrationSettings:
         _int("step", self.step, 1, MAX_STEP)
         _int("margin", self.margin, 0, 400)
         _int("confirmations", self.confirmations, 2, 20)
+        _int("verification_moves", self.verification_moves, 2, 50)
+        _int("max_verification_misses", self.max_verification_misses, 0, 10)
+        if self.max_verification_misses >= self.verification_moves:
+            raise CalibrationRefused(
+                f"max_verification_misses ({self.max_verification_misses}) must be smaller "
+                f"than verification_moves ({self.verification_moves}) -- otherwise the "
+                "observer-reliability check can never fail and is not a check."
+            )
         _int("max_steps_per_direction", self.max_steps_per_direction, 1, 1000)
         _int("max_torque_ms", self.max_torque_ms, 1, 3_600_000)
         _int("max_stall_ms", self.max_stall_ms, 0, 3_600_000)
@@ -421,33 +440,55 @@ def _search_direction(
             search_bound=bound,
         )
 
-    def _verify_observer_can_see() -> None:
-        """Prove the observer is not simply blind before believing a stop.
+    def _verify_observer_reliability() -> None:
+        """Measure the observer against known-real motion before believing a stop.
 
-        Retreat one step from the last position that verifiably moved and look
-        again. A joint pinned against a stop visibly comes off it; an observer that
-        cannot see this joint (lens cap, bad ROI, occlusion, the joint is edge-on to
-        the camera) reports nothing either way. "I cannot see" must never be
-        recorded as "I measured a limit", so that case aborts.
+        "No motion" from an unreliable observer is worthless evidence, and N
+        consecutive misses is only significant if the observer's own miss rate is
+        low. So before recording a limit, retreat to two positions that BOTH
+        verifiably moved earlier -- one and two steps back from ``last_confirmed``,
+        strictly on the safe side of the suspected stop -- and oscillate between
+        them ``verification_moves`` times. Every one of those moves genuinely
+        changes the joint's position, so every "no motion" report during the burst
+        is demonstrably the observer's error, not the joint's.
+
+        More than ``max_verification_misses`` errors and the run aborts: an observer
+        that misses real motion this often cannot distinguish a mechanical stop from
+        its own blindness, and neither can we. A totally blind observer (lens cap,
+        dead camera, joint outside the ROI) fails this immediately, which is the
+        point -- "I cannot see" must never be recorded as "I measured a limit".
+
+        The oscillation positions are deliberately inside the travel we already
+        confirmed, so this burst costs torque time but accrues no stall time.
         """
         nonlocal current
-        probe_target = _apply_margin(name, last_confirmed, -sign * settings.step, lo, hi)
-        if probe_target == current:
+        near = _apply_margin(name, last_confirmed, -sign * settings.step, lo, hi)
+        far = _apply_margin(name, last_confirmed, -sign * 2 * settings.step, lo, hi)
+        if near == far or near == current:
+            # Not enough confirmed travel behind us to build a known-motion probe.
             raise CalibrationAborted(
-                f"{name}: cannot verify the observer (no legal retreat position from "
-                f"{current}) -- refusing to record a limit on unverified evidence."
+                f"{name}: no room to verify the observer against known motion near "
+                f"{current} -- refusing to record a limit on unverified evidence."
             )
-        probe_before = _capture(observer, f"{name} observer check before")
-        _torque_burst(arm, name, probe_target, settings, budget)
-        probe_after = _capture(observer, f"{name} observer check after")
-        moved_back = _observe(observer, probe_before, probe_after, f"{name} observer check")
-        current = probe_target
-        if not moved_back:
+        sequence = [near if i % 2 == 0 else far for i in range(settings.verification_moves)]
+        misses = 0
+        for target in sequence:
+            probe_before = _capture(observer, f"{name} reliability probe before")
+            _torque_burst(arm, name, target, settings, budget)
+            probe_after = _capture(observer, f"{name} reliability probe after")
+            moved_back = _observe(observer, probe_before, probe_after, f"{name} reliability probe")
+            current = target
+            if not moved_back:
+                misses += 1
+        if misses > settings.max_verification_misses:
             raise CalibrationAborted(
-                f"{name}: the observer reported no motion for a retreat from a suspected "
-                f"stop ({current}). That means it cannot see this joint (occlusion, bad "
-                "ROI, dead camera), not that the joint is at its limit. Aborting without "
-                "writing a result."
+                f"{name}: the observer missed {misses} of {len(sequence)} moves that "
+                "definitely happened (an oscillation between two positions it had already "
+                f"watched the joint reach), more than the {settings.max_verification_misses} "
+                "allowed. It cannot reliably see this joint -- occlusion, a bad ROI, a dead "
+                "camera, lighting, or a viewing angle that makes this joint's motion nearly "
+                "invisible. Its 'no motion' reports are therefore not evidence of a "
+                "mechanical stop. Aborting without writing a result."
             )
 
     # Always start each direction from the same known-safe place so the two
@@ -475,7 +516,7 @@ def _search_direction(
                 # the observer is not blind, then record conservatively from the
                 # last position that verifiably moved -- it is a real stop, just one
                 # we could not confirm with a full run of extra steps.
-                _verify_observer_can_see()
+                _verify_observer_reliability()
                 return _result(
                     _apply_margin(name, last_confirmed, -sign * settings.margin, lo, hi),
                     FINDING_MECHANICAL_STOP,
@@ -519,7 +560,7 @@ def _search_direction(
             # into the "sitting on the rail" branch above, which resolves it.
             continue
 
-        _verify_observer_can_see()
+        _verify_observer_reliability()
         return _result(
             _apply_margin(name, last_confirmed, -sign * settings.margin, lo, hi),
             FINDING_MECHANICAL_STOP,
@@ -575,11 +616,11 @@ def calibrate_joint(
             f"of a {span}-unit searchable band [{lo}, {hi}] -- the result would be empty or "
             "inverted. Refusing to run with a margin this large."
         )
-    if 2 * settings.step >= span:
+    if 3 * settings.step >= span:
         raise CalibrationRefused(
             f"{key}: step {settings.step} is too coarse for a {span}-unit searchable band "
-            f"[{lo}, {hi}] -- at least two steps per direction are needed to distinguish "
-            "travel from a stop."
+            f"[{lo}, {hi}] -- the search needs room for at least a couple of probe steps "
+            "plus the two-step retreat the observer-reliability burst oscillates over."
         )
 
     torque_before = budget.torque_ms
