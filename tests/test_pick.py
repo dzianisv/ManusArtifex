@@ -676,3 +676,74 @@ def test_descend_and_lift_are_recorded_as_open_loop(calibrated):
         assert any("open loop" in d and "lift" in d.lower() for d in details)
     finally:
         arm.close()
+
+
+# ===========================================================================
+# 7. CLI
+# ===========================================================================
+
+
+def test_cli_pick_refuses_real_hardware_without_the_presence_flag(monkeypatch, capsys):
+    """The refusal has to happen before the transport is opened.
+
+    ``_make_arm`` and ``protocol.HidTransport`` are both replaced with a landmine,
+    exactly as in the calibrate gate's test: if the guard ever failed, this fails
+    loudly instead of reaching for the real HID device.
+    """
+    from robohand import cli, protocol
+
+    monkeypatch.delenv("ROBOHAND_TRANSPORT", raising=False)
+
+    def landmine(*args, **kwargs):
+        raise AssertionError("hardware path reached -- the presence gate did not hold")
+
+    monkeypatch.setattr(cli, "_make_arm", landmine)
+    monkeypatch.setattr(protocol, "HidTransport", landmine)
+
+    assert cli.main(["pick", "--locator", "classical"]) == 2
+    err = capsys.readouterr().err
+    assert "REFUSING TO RUN" in err
+    assert "--i-am-present-and-watching" in err
+
+    # And the ground-truth locator is refused on real hardware even with the
+    # operator flag, because there is no ground truth to read.
+    assert cli.main(["pick", "--locator", "sim", "--i-am-present-and-watching"]) == 2
+    assert "means nothing on real hardware" in capsys.readouterr().err
+
+
+def test_cli_pick_reports_the_calibration_refusal_with_a_nonzero_exit(capsys):
+    from robohand import cli
+
+    assert cli.main(["--sim", "pick", "--locator", "sim"]) == 2
+    err = capsys.readouterr().err
+    assert "refusing to pick" in err
+    assert "not calibrated" in err
+
+
+def test_cli_pick_succeeds_in_sim_and_emits_a_diagnosable_log(calibrated, capsys):
+    import json as _json
+
+    from robohand import cli
+
+    assert cli.main(["--sim", "pick", "--locator", "sim", "--json"]) == 0
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload["success"] is True
+    assert payload["state"] == "DONE"
+    assert {e["state"] for e in payload["log"]} >= {"LOCATE", "APPROACH", "DESCEND", "GRASP", "DONE"}
+
+
+def test_cli_pick_returns_nonzero_on_a_failed_pick(calibrated, capsys):
+    from robohand import cli
+
+    # Out of reach: visible, but past what the joints can deliver.
+    assert cli.main(["--sim", "pick", "--locator", "sim", "--object-x", "100"]) == 1
+    out = capsys.readouterr().out
+    assert "FAILED" in out
+    assert "approach_joint_limits_reached" in out
+
+
+def test_cli_pick_override_requires_a_reason(capsys):
+    from robohand import cli
+
+    assert cli.main(["--sim", "pick", "--locator", "sim", "--allow-uncalibrated"]) == 2
+    assert "override_reason" in capsys.readouterr().err

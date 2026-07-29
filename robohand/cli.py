@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import config, poses as pose_store, sequences
+from . import config, locate, poses as pose_store, sequences
 from .arm import Arm
 from .protocol import NoResponse
 from .safety import CalibrationRequired, SafetyViolation
@@ -241,33 +241,117 @@ def cmd_record(args: argparse.Namespace) -> int:
 
 
 def cmd_pick(args: argparse.Namespace) -> int:
-    """First-cut pick routine: open -> approach -> descend -> close (ladder) -> lift.
+    """Vision-guided pick: locate, servo, descend, grasp on the ladder, verify, lift.
 
-    Relies on the pick_approach/pick_descend/pick_lift poses in poses.json, which ship
-    as placeholders -- run 'robohand teach pick_approach' / 'pick_descend' to
-    calibrate them for a real target before trusting this for anything but a dry run.
+    Replaces an earlier placeholder that played back three ``pick_*`` poses which
+    were never present in poses.json -- it raised KeyError the moment anyone ran
+    it, and it was an open-loop lunge at a precomputed target besides. See
+    docs/pick.md.
     """
+    from . import pick as pick_module
+    from .locate import LocatorError
+
+    simulated = _is_simulated(args)
+
+    # Checked BEFORE _make_arm(), so the real HID device is never even opened
+    # without an operator. Same gate, same reasoning, as cmd_calibrate.
+    if not simulated and not args.i_am_present_and_watching:
+        print(
+            "REFUSING TO RUN.\n"
+            "\n"
+            "A pick drives the arm to a position derived from a camera, then closes\n"
+            "the jaws on whatever is there. Every layer below it is bounded, but the\n"
+            "target itself comes from a detector that can be wrong -- and the descend\n"
+            "and lift heights are open loop, because one camera on a table plane\n"
+            "measures X and Y and never Z.\n"
+            "\n"
+            "Run it only with a human physically present, watching the arm, with the\n"
+            "power switch within reach and the workspace clear.\n"
+            "\n"
+            "Re-run with --i-am-present-and-watching to confirm, or add --sim to\n"
+            "rehearse the whole routine against the simulator with no hardware access.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.locator == "sim" and not simulated:
+        print(
+            "error: --locator sim reads simulator ground truth and means nothing on "
+            "real hardware. Use --locator classical or --locator gemini, or add --sim.",
+            file=sys.stderr,
+        )
+        return 2
+
+    settings_kwargs = {}
+    for attr, key in (
+        ("step", "grip_step"),
+        ("descend_units", "descend_units"),
+        ("lift_units", "lift_units"),
+        ("max_steps", "max_approach_steps"),
+        ("tolerance_px", "approach_tolerance_px"),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None:
+            settings_kwargs[key] = value
+    if args.release:
+        settings_kwargs["hold_on_success"] = False
+    settings = pick_module.PickSettings(**settings_kwargs)
+
     with _make_arm(args) as arm:
+        if args.locator == "sim":
+            # The simulated locator needs something to look at. Placed here, in
+            # the CLI, because it is scene setup for a rehearsal -- pick.py knows
+            # nothing about the simulator beyond what the Locator interface says.
+            from .sim import SimObject, attach_world
+
+            attach_world(arm._transport, SimObject(x=args.object_x, y=args.object_y))
+
+        locator_kwargs = {}
+        if args.target:
+            # The two real backends name their target differently because they
+            # look for different things: a colour band vs a description.
+            key = "object_prompt" if args.locator == "gemini" else "object_color"
+            locator_kwargs[key] = args.target
         try:
-            print("1/5 open grip")
-            arm.open_grip()
-            print("2/5 approach")
-            approach = pose_store.get_pose("pick_approach")
-            arm.set_positions(approach["positions"], duration_ms=approach.get("duration_ms"))
-            print("3/5 descend")
-            descend = pose_store.get_pose("pick_descend")
-            arm.set_positions(descend["positions"], duration_ms=descend.get("duration_ms"))
-            print("4/5 close grip (incremental ladder, stops on contact)")
-            grip_result = arm.close_grip(step=args.step)
-            print("5/5 lift")
-            lift = pose_store.get_pose("pick_lift")
-            arm.set_positions(lift["positions"], duration_ms=lift.get("duration_ms"))
-            print(f"Done. Grip ladder result: {grip_result}. Verify visually/with camera that an object was grasped.")
+            locator = locate.locator_for_arm(arm, args.locator, **locator_kwargs)
+        except LocatorError as e:
+            print(f"error: locator unavailable -- {e}", file=sys.stderr)
+            return 2
+
+        try:
+            result = pick_module.pick(
+                arm,
+                locator,
+                settings,
+                allow_uncalibrated_override=args.allow_uncalibrated,
+                override_reason=args.override_reason,
+            )
         except KeyboardInterrupt:
             arm.relax()
             print("\nInterrupted -- servos relaxed.", file=sys.stderr)
             return 130
-    return 0
+
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+    else:
+        print(f"Locator: {result.locator}")
+        for entry in result.log:
+            data = " ".join(f"{k}={v}" for k, v in entry.data.items())
+            print(f"  [{entry.state:<11}] {entry.detail}{'  ' + data if data else ''}")
+        print(
+            f"\n{'PICKED' if result.success else result.state.value}: {result.reason} "
+            f"({result.elapsed_s:.1f}s)"
+        )
+        if result.holding:
+            print(
+                "Servos left under torque so the object is not dropped. The safety "
+                "watchdog will force-unload them shortly -- this arm cannot hold "
+                "anything indefinitely (docs/pick.md)."
+            )
+        elif result.unloaded:
+            print("Arm unloaded.")
+
+    return 0 if result.success else 1
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
@@ -502,8 +586,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("file")
     p.set_defaults(func=cmd_record)
 
-    p = sub.add_parser("pick", help="Run open->approach->descend->close->lift pick routine")
+    p = sub.add_parser(
+        "pick",
+        help="Vision-guided pick: locate, visually servo, descend, grasp, verify, lift",
+        description=(
+            "Runs the LOCATE/APPROACH/DESCEND/GRASP/VERIFY/LIFT/VERIFY_HELD state "
+            "machine. Refuses to run on uncalibrated joints without an explicit "
+            "reason, and refuses on real hardware without an operator present. "
+            "See docs/pick.md."
+        ),
+    )
+    p.add_argument(
+        "--locator",
+        choices=("classical", "gemini", "sim"),
+        default="sim",
+        help="Perception backend: classical HSV blob detection, Gemini Robotics-ER "
+             "1.6, or simulator ground truth (--sim only). Default: sim.",
+    )
+    p.add_argument("--target", default=None, help="What to look for (a colour name, or a description for --locator gemini)")
     p.add_argument("--step", type=int, default=None, help="Grip ladder step size in raw units")
+    p.add_argument("--descend-units", type=int, default=None, help="OPEN LOOP raw-unit offset to grasp height")
+    p.add_argument("--lift-units", type=int, default=None, help="OPEN LOOP raw-unit offset to lift by")
+    p.add_argument("--max-steps", type=int, default=None, help="Visual servo step budget for APPROACH")
+    p.add_argument("--tolerance-px", type=float, default=None, help="APPROACH convergence tolerance, pixels")
+    p.add_argument("--object-x", type=float, default=10.0, help="[--locator sim] object X in the simulated workspace, mm")
+    p.add_argument("--object-y", type=float, default=140.0, help="[--locator sim] object Y in the simulated workspace, mm")
+    p.add_argument("--release", action="store_true", help="Unload on success instead of holding the object")
+    p.add_argument("--allow-uncalibrated", action="store_true", help="Run on uncalibrated joints (requires --override-reason)")
+    p.add_argument("--override-reason", default=None, help="Logged justification for --allow-uncalibrated")
+    p.add_argument(
+        "--i-am-present-and-watching",
+        action="store_true",
+        help="Required on real hardware: confirms an operator is watching with the power switch in reach",
+    )
+    p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_pick)
 
     p = sub.add_parser("doctor", help="Report device/camera/calibration status and active safety layers")
@@ -553,9 +669,13 @@ def main(argv: Optional[list] = None) -> int:
     # clauses below are bound before any command runs.
     from .calibrate import CalibrationAborted, CalibrationRefused
     from .observer import ObserverError
+    from .pick import PickRefused
 
     try:
         return args.func(args)
+    except PickRefused as e:
+        print(f"error: refusing to pick -- {e}", file=sys.stderr)
+        return 2
     except CalibrationRefused as e:
         print(f"error: refusing to calibrate -- {e}", file=sys.stderr)
         return 2
