@@ -61,6 +61,8 @@ def _open_vision_guard() -> Optional["VisionGuard"]:
         diff_threshold=config.VISION_DIFF_THRESHOLD,
         min_changed_pixels=config.VISION_MIN_CHANGED_PIXELS,
         blur_ksize=config.VISION_BLUR_KSIZE,
+        normalize=config.VISION_NORMALIZE,
+        normalized_threshold=config.VISION_NORMALIZED_THRESHOLD,
     )
 
 

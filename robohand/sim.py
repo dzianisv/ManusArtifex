@@ -66,6 +66,17 @@ DEFAULT_MECHANICAL_LIMITS: Dict[int, Tuple[int, int]] = {
 
 DEFAULT_BATTERY_VOLTAGE = 7.4
 
+# How far the simulated pack sags per raw unit of *real* joint travel, and the
+# floor it will not droop below. This is a deliberately crude stand-in for the
+# pack's internal-resistance drop under load: its only job is to make "a joint
+# that actually moved drew current" observable through ``get_battery_voltage`` the
+# way it is on the real arm, so the liveness check can tell a disconnected servo
+# (no motion, flat pack) from a live-but-unseen one (moved, pack sagged). Sized so
+# a single liveness excursion (~150-300 units) drops the pack well past
+# calibrate.py's detection epsilon (0.05 V) without a whole run drooping absurdly.
+_BATTERY_SAG_PER_UNIT = 0.0004
+_BATTERY_SAG_FLOOR_V = 3.0
+
 
 @dataclasses.dataclass
 class SimJoint:
@@ -79,6 +90,12 @@ class SimJoint:
     obstruction_max: Optional[int] = None
     stall_ms: float = 0.0
     contact_events: int = 0
+    dead: bool = False
+    # Cumulative raw units this joint has *actually* moved. Stands in for charge
+    # drawn from the pack: a servo only pulls current when it turns a load, so a
+    # completely dead (disconnected/failed-open) joint never adds to this, and its
+    # battery therefore never sags -- exactly the servo-5 signature.
+    travel: float = 0.0
 
     def _reachable_bounds(self) -> Tuple[int, int]:
         lo, hi = self.mech_min, self.mech_max
@@ -98,6 +115,19 @@ class SimJoint:
         (e.g. a grasped object) blocks it, that is normal gripper operation, not a
         stall, and is tracked separately.
         """
+        if self.dead:
+            # A completely dead servo (disconnected / failed-open -- the real
+            # SHOULDER_LIFT / servo-5 fault). The controller still energises the bus
+            # for the commanded window because it has no feedback and cannot know
+            # the servo is gone, so ``torque_on`` flips exactly as it would for a
+            # live joint (torque/packet accounting is identical). But nothing turns:
+            # the position never changes, so this is NOT a locked-rotor jam (no
+            # stall accrues) and NO current is drawn (``travel`` does not grow, so
+            # the battery does not sag). That flat-battery-plus-no-motion signature
+            # is precisely what tells a disconnected servo apart from a jam.
+            self.torque_on = True
+            self.blocked = False
+            return self.position
         mech_lo, mech_hi = self.mech_min, self.mech_max
         reach_lo, reach_hi = self._reachable_bounds()
         achievable = max(reach_lo, min(reach_hi, target))
@@ -114,6 +144,7 @@ class SimJoint:
             self.blocked = True
         else:
             self.blocked = False
+        self.travel += abs(achievable - self.position)
         self.position = achievable
         return achievable
 
@@ -164,6 +195,17 @@ class SimTransport:
         joint.obstruction_min = min
         joint.obstruction_max = max
 
+    def set_dead(self, servo_id: int, dead: bool = True) -> None:
+        """Simulate a completely dead servo (disconnected / failed-open).
+
+        The joint stops responding to every commanded move: it never changes
+        position, never stalls, and draws no current (the pack stays flat) -- the
+        real SHOULDER_LIFT / servo-5 signature. Torque still flips on for the
+        commanded window, because the controller has no feedback and cannot tell.
+        Test/demo use only, mirroring ``set_obstruction``.
+        """
+        self.joints[servo_id].dead = dead
+
     def stall_ms_total(self) -> float:
         return sum(j.stall_ms for j in self.joints.values())
 
@@ -174,7 +216,8 @@ class SimTransport:
 
     def get_battery_voltage(self) -> float:
         self.log.append({"cmd": "BATTERY"})
-        return self._battery_voltage
+        drawn = sum(j.travel for j in self.joints.values())
+        return max(_BATTERY_SAG_FLOOR_V, self._battery_voltage - _BATTERY_SAG_PER_UNIT * drawn)
 
     def move_servos(
         self,

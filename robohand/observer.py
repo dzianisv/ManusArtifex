@@ -33,6 +33,22 @@ Implementations here:
 * ``FlakyMotionObserver`` / ``NullMotionObserver`` -- deliberate fault injectors for
   tests: an observer that occasionally misses real motion, and one that never sees
   anything at all (a lens cap, a dead camera, a joint outside the ROI).
+* ``NoisyMotionObserver`` -- the mirror-image fault injector: an observer whose
+  no-motion *noise floor* sits at or above its own "motion" threshold, so it reports
+  motion on every frame pair regardless of whether the joint moved. This is the
+  auto-exposure-hunting failure the existing consecutive-miss / reliability-burst
+  net is structurally blind to (there are no misses to count), and the one
+  ``camera_health`` exists to catch. See docs/verification-camera.md.
+
+Two extra, defaulted methods sit alongside ``observe`` so a health gate can reason
+about *how much* an observer sees, not only the yes/no answer:
+
+* ``score(before, after) -> float`` -- a continuous motion magnitude. The default
+  is a 0/1 projection of ``observe`` so every existing subclass keeps working
+  untouched; the vision path overrides it with the real changed-pixel count.
+* ``motion_threshold() -> float`` -- the score at/above which this observer calls a
+  pair "motion". Default 1.0 (matching the 0/1 ``score``); the vision path returns
+  its guard's ``min_changed_pixels``.
 """
 
 from __future__ import annotations
@@ -70,6 +86,26 @@ class MotionObserver(abc.ABC):
     @abc.abstractmethod
     def observe(self, before: Any, after: Any) -> bool:
         """True if motion is detected between two snapshots from ``capture()``."""
+
+    def score(self, before: Any, after: Any) -> float:
+        """Continuous motion magnitude between two snapshots.
+
+        Default: a coarse 0/1 projection of ``observe`` so every existing observer
+        keeps working with no change. The real-camera path overrides this with the
+        guard's changed-pixel count, which is what ``camera_health`` needs to
+        measure a no-motion *noise floor* (a boolean cannot express "reported motion
+        but only barely" vs "reported motion by a mile").
+        """
+        return 1.0 if self.observe(before, after) else 0.0
+
+    def motion_threshold(self) -> float:
+        """The ``score`` at or above which this observer calls a pair "motion".
+
+        Default 1.0, consistent with the 0/1 default ``score``. The vision path
+        overrides it with the guard's ``min_changed_pixels`` so the health gate can
+        compare a measured noise floor against the *actual* decision boundary.
+        """
+        return 1.0
 
     def describe(self) -> str:
         return type(self).__name__
@@ -112,6 +148,21 @@ class VisionMotionObserver(MotionObserver):
         if before is None or after is None:
             raise ObserverError("cannot compare a missing frame")
         return bool(self._guard.detect_motion(before, after))
+
+    def score(self, before: np.ndarray, after: np.ndarray) -> float:
+        """Real continuous magnitude: the guard's changed-pixel count for this pair.
+
+        This is what makes a no-motion noise floor measurable -- ``camera_health``
+        samples this across passive frame pairs and compares its p95 against
+        ``motion_threshold`` to decide whether the observer can tell a real move
+        from its own noise.
+        """
+        if before is None or after is None:
+            raise ObserverError("cannot compare a missing frame")
+        return float(self._guard.motion_score(before, after))
+
+    def motion_threshold(self) -> float:
+        return float(self._guard.min_changed_pixels)
 
     def describe(self) -> str:
         return (
@@ -279,6 +330,83 @@ class NullMotionObserver(MotionObserver):
 
     def describe(self) -> str:
         return "NullMotionObserver(sees nothing, ever)"
+
+
+class NoisyMotionObserver(MotionObserver):
+    """The mirror image of ``NullMotionObserver``: it sees "motion" *everywhere*.
+
+    Fault injector for the exact defect ``camera_health`` exists to catch. On a real
+    camera that cannot lock exposure (macOS AVFoundation, dark scene), auto-exposure
+    hunts continuously, so a raw changed-pixel count on two frames taken with **zero
+    commanded motion** can exceed the count from a genuine joint move, pushing the
+    observer's noise floor *above* its own ``min_changed_pixels`` threshold so it
+    answers "moved" to every pair.
+
+    (The originally-reported "6-12x / 268k-550k px vs ~46k" magnitudes were inflated
+    by a since-fixed capture-staleness bug in ``camera.Camera.grab`` -- see
+    docs/verification-camera.md; with capture fixed the raw+ROI no-motion floor is
+    ~30 px. This injector is deliberately magnitude-agnostic: it reproduces the
+    *shape* of the fault -- noise floor >= threshold, independent of real motion --
+    which is what makes it invisible to a boolean-only sensitivity check, not any
+    particular pixel count.)
+
+    Why this is dangerous and why the existing net misses it: ``calibrate.py`` only
+    runs its observer-reliability burst after ``confirmations`` *consecutive
+    no-motion* reports. An observer that always reports motion never produces a
+    single miss, so ``consecutive_misses`` never accumulates, the reliability burst
+    is never triggered, and every search step reads ``moved=True`` -- the routine
+    walks straight to the absolute rail on every joint, reproducing the incident.
+
+    This class reports ``score`` from a synthetic noise-floor distribution that is
+    *independent of whether the arm actually moved* -- exactly the property that
+    makes the real fault invisible to a boolean-only sensitivity check. With
+    ``noise_floor`` at or above ``threshold`` (the default), ``observe`` is True on
+    every pair. Set ``noise_floor`` below ``threshold`` to model a merely-degraded
+    (but still passing) camera.
+    """
+
+    def __init__(
+        self,
+        *,
+        noise_floor: float,
+        threshold: float = float(config.VISION_MIN_CHANGED_PIXELS),
+        jitter: float = 0.0,
+        seed: int = 0,
+    ) -> None:
+        if noise_floor < 0 or threshold < 0 or jitter < 0:
+            raise ValueError("noise_floor, threshold and jitter must be non-negative")
+        self._noise_floor = float(noise_floor)
+        self._threshold = float(threshold)
+        self._jitter = float(jitter)
+        self._rng = random.Random(seed)
+        self.calls = 0
+
+    def available(self) -> bool:
+        return True
+
+    def capture(self) -> Any:
+        # Opaque, monotonic token: the content is irrelevant because score/observe
+        # deliberately ignore it -- that independence from real motion IS the fault.
+        self.calls += 1
+        return self.calls
+
+    def score(self, before: Any, after: Any) -> float:
+        noise = self._noise_floor
+        if self._jitter:
+            noise += self._rng.uniform(-self._jitter, self._jitter)
+        return max(0.0, noise)
+
+    def observe(self, before: Any, after: Any) -> bool:
+        return self.score(before, after) >= self._threshold
+
+    def motion_threshold(self) -> float:
+        return self._threshold
+
+    def describe(self) -> str:
+        return (
+            f"NoisyMotionObserver(noise_floor={self._noise_floor}, "
+            f"threshold={self._threshold}, jitter={self._jitter})"
+        )
 
 
 def observer_for_arm(arm, *, servo_ids: Optional[Iterable[int]] = None) -> MotionObserver:

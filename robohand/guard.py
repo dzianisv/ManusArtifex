@@ -65,6 +65,19 @@ class VisionGuard:
     diff_threshold: int = 25
     min_changed_pixels: int = 150
     blur_ksize: int = 5
+    #: Per-frame brightness normalisation, applied inside the ROI before diffing.
+    #: ``"none"`` (default) is the original raw-absdiff behaviour every existing
+    #: caller and test relies on -- it is byte-for-byte unchanged. ``"mean"``
+    #: subtracts each frame's own mean (cancels a global brightness *offset*).
+    #: ``"zscore"`` subtracts the mean and divides by the standard deviation
+    #: (cancels the full affine gain+offset an auto-exposure loop produces, so a
+    #: dark scene whose exposure hunts frame-to-frame stops reading as motion --
+    #: see docs/verification-camera.md for the measured separation numbers). When a
+    #: normalisation mode other than ``"none"`` is active the changed-pixel test
+    #: uses ``normalized_threshold`` (in standard-deviation units for ``"zscore"``)
+    #: instead of the 0..255 ``diff_threshold``.
+    normalize: str = "none"
+    normalized_threshold: float = 0.5
 
     def available(self) -> bool:
         return self.frame_source is not None
@@ -73,6 +86,34 @@ class VisionGuard:
         if not self.available():
             return None
         return self.frame_source()
+
+    def _blur(self, diff: np.ndarray) -> np.ndarray:
+        ksize = self.blur_ksize if self.blur_ksize % 2 == 1 else self.blur_ksize + 1
+        if ksize > 1:
+            diff = cv2.GaussianBlur(diff, (ksize, ksize), 0)
+        return diff
+
+    def _normalized_score(self, before_gray: np.ndarray, after_gray: np.ndarray) -> int:
+        """Changed-pixel count after per-frame brightness normalisation.
+
+        ``"mean"`` removes a global offset; ``"zscore"`` removes an affine
+        gain+offset (mathematically invariant to ``x -> gain*x + offset``, which is
+        the first-order model of what an auto-exposure loop does to every pixel at
+        once). Real motion is a *local, structural* change and survives both;
+        global exposure hunting does not. Threshold is ``normalized_threshold``
+        (standard-deviation units for ``"zscore"``), not the 0..255 grey-level
+        ``diff_threshold``.
+        """
+        b = before_gray.astype(np.float32)
+        a = after_gray.astype(np.float32)
+        if self.normalize == "zscore":
+            b = (b - b.mean()) / (float(b.std()) + 1e-6)
+            a = (a - a.mean()) / (float(a.std()) + 1e-6)
+        else:  # "mean"
+            b = b - b.mean()
+            a = a - a.mean()
+        diff = self._blur(np.abs(a - b))
+        return int(np.count_nonzero(diff > self.normalized_threshold))
 
     def motion_score(self, frame_before: np.ndarray, frame_after: np.ndarray) -> int:
         """Count of changed pixels inside the ROI between two frames."""
@@ -87,10 +128,11 @@ class VisionGuard:
         before_gray = cv2.cvtColor(before_roi, cv2.COLOR_BGR2GRAY) if before_roi.ndim == 3 else before_roi
         after_gray = cv2.cvtColor(after_roi, cv2.COLOR_BGR2GRAY) if after_roi.ndim == 3 else after_roi
 
+        if self.normalize != "none":
+            return self._normalized_score(before_gray, after_gray)
+
         diff = cv2.absdiff(before_gray, after_gray)
-        ksize = self.blur_ksize if self.blur_ksize % 2 == 1 else self.blur_ksize + 1
-        if ksize > 1:
-            diff = cv2.GaussianBlur(diff, (ksize, ksize), 0)
+        diff = self._blur(diff)
         _, thresholded = cv2.threshold(diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
         return int(np.count_nonzero(thresholded))
 

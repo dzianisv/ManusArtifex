@@ -374,6 +374,38 @@ VISION_DIFF_THRESHOLD = int(_vision.get("diff_threshold", 25))
 VISION_MIN_CHANGED_PIXELS = int(_vision.get("min_changed_pixels", 150))
 VISION_BLUR_KSIZE = int(_vision.get("blur_ksize", 5))
 
+# --- Opt-in brightness-normalised metric (see docs/verification-camera.md) ---
+# The default raw-absdiff path (VISION_NORMALIZE="none") is unchanged and is what
+# every existing move/grip-ladder/calibration test exercises. A deployment on a
+# camera that cannot lock exposure (macOS AVFoundation in a dark scene) can opt
+# into "zscore" -- per-frame mean/std normalisation, which is invariant to the
+# affine (gain+offset) brightness swings auto-exposure produces, so the changed-
+# pixel count reflects real local motion instead of global exposure hunting.
+# When "zscore" is used the changed-pixel threshold is VISION_NORMALIZED_THRESHOLD
+# (in per-frame standard-deviation units), NOT VISION_DIFF_THRESHOLD (0..255
+# grey levels), and VISION_MIN_CHANGED_PIXELS must be re-tuned for the new metric
+# via `robohand camera-check` before it is trusted.
+VISION_NORMALIZE = str(_vision.get("normalize", "none")).lower()
+if VISION_NORMALIZE not in ("none", "mean", "zscore"):
+    raise ConfigError(
+        f"config.json vision.normalize must be one of 'none', 'mean', 'zscore', "
+        f"got {VISION_NORMALIZE!r}."
+    )
+VISION_NORMALIZED_THRESHOLD = float(_vision.get("normalized_threshold", 0.5))
+
+# --- Camera-health gate (robohand/camera_health.py) --------------------------
+# Passive no-motion frames sampled to measure the observer's own noise floor, the
+# spacing between them (long enough to span an auto-exposure hunting cycle), the
+# safety factor the detection threshold must clear the measured p95 noise by, and
+# the factor a known-motion sample must clear the noise floor by (visibility).
+# Defaults: 15 frames x 0.4 s ~= 5.6 s -- measured empirically to reliably span an
+# auto-exposure hunting burst; a shorter window can land entirely inside a stable
+# stretch and miss the hunting (a false PASS). See docs/verification-camera.md.
+VISION_HEALTH_FRAMES = int(_vision.get("health_frames", 15))
+VISION_HEALTH_INTERVAL_S = float(_vision.get("health_interval_s", 0.4))
+VISION_HEALTH_MARGIN = float(_vision.get("health_margin", 1.5))
+VISION_HEALTH_SEPARATION = float(_vision.get("health_separation", 3.0))
+
 _gripper = _CONFIG.get("gripper", {})
 _grip_abs_lo, _grip_abs_hi = absolute_bounds("GRIP")
 GRIP_STEP = _require_positive_int(_gripper.get("step", 40), "gripper.step")

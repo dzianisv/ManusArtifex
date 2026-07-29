@@ -67,6 +67,28 @@ class OutOfGlobalGuard(SafetyViolation):
     """
 
 
+#: ``StallDetected`` is *defined* in ``guard`` (it is raised by the vision layer),
+#: but it is naturally *caught* alongside the Layer-1 refusals above, so user code
+#: reasonably writes ``except safety.StallDetected`` -- which used to raise
+#: AttributeError. Re-exported here so both import paths resolve to the SAME class.
+#:
+#: Deliberately lazy (PEP 562 module ``__getattr__``) rather than a top-level
+#: ``from .guard import StallDetected``: ``guard`` imports cv2/numpy, which are NOT
+#: declared dependencies (see pyproject: only hidapi) and which ``arm.py`` is careful
+#: to import only inside functions. An eager import here would make cv2 a hard
+#: requirement of the core safety module for everyone.
+__all__ = ["SafetyViolation", "CalibrationRequired", "PositionOutOfRange",
+           "OutOfGlobalGuard", "StallDetected", "SafetyLayer"]
+
+
+def __getattr__(name: str):
+    if name == "StallDetected":
+        from .guard import StallDetected
+
+        return StallDetected
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 class SafetyLayer:
     """Owns a transport and is the only thing allowed to mint motion tokens for it."""
 
@@ -97,6 +119,12 @@ class SafetyLayer:
         self._torque_since: Dict[int, float] = {}  # servo_id -> monotonic start of continuous torque
         self._closed = False
         self.override_log: list = []
+
+        # Lazy, cached vision-health verdict (see _vision_guard_is_healthy). None
+        # until the first guarded move actually uses the guard, so this never adds
+        # N-frame capture cost to construction or to unguarded moves.
+        self._vision_health_checked = False
+        self._vision_healthy = True
 
         self._watchdog_stop = threading.Event()
         self._watchdog_poll_s = watchdog_poll_s
@@ -150,6 +178,57 @@ class SafetyLayer:
         delta = abs(int(max_delta))
         steps = max(1, -(-delta // self.max_step_per_move)) if delta else 1
         return steps, max(config.MIN_DURATION_MS, duration_ms // steps)
+
+    def _vision_guard_is_healthy(self, guard) -> bool:
+        """Lazily assess, once, whether ``guard`` can tell motion from its own noise.
+
+        Calibration fails **closed** on an unhealthy camera (``camera_health``
+        raises and the run refuses to write anything) because a supervised search
+        that infers mechanical stops from "no motion" is worthless if "no motion" is
+        a coin flip. A regular one-shot ``move`` must **not** fail closed: per the
+        degrade-safely convention documented on ``observer.VisionMotionObserver``
+        ("A no-op is the right degrade-safely behaviour for a one-shot move guarded
+        by layers 1+2"), a *proven-unhealthy* camera is treated exactly like *no*
+        camera -- warn loudly once, then keep moving on layers 1+2 alone. See
+        docs/safety.md for the asymmetry and its rationale.
+
+        The verdict is computed at most once per ``SafetyLayer`` instance, the first
+        time a guarded move actually uses the guard, and cached. That keeps the
+        N-frame capture out of construction and out of every subsequent move, so it
+        adds no per-call cost on hardware and cannot perturb call-count assertions on
+        later synthetic moves in tests. The sample uses ``interval_s=0`` (no sleep)
+        so it adds no wall-clock time; consecutive real-camera grabs still sample
+        genuine frame-to-frame exposure hunting, which is the fault being screened.
+        """
+        if self._vision_health_checked:
+            return self._vision_healthy
+        self._vision_health_checked = True
+        try:
+            from . import camera_health
+
+            report = camera_health.assess_guard_health(
+                guard,
+                frames=config.VISION_HEALTH_FRAMES,
+                interval_s=0.0,
+                margin=config.VISION_HEALTH_MARGIN,
+            )
+        except Exception as exc:
+            # A health screen that itself blows up must never take down a normal
+            # move. Default to "healthy" so behaviour is exactly as it was before
+            # this gate existed (guard runs, layer 3 active).
+            logger.debug("vision health check errored (%s); assuming healthy", exc)
+            self._vision_healthy = True
+            return True
+        self._vision_healthy = report.healthy if report.available else True
+        if report.available and not report.healthy:
+            logger.warning(
+                "VISION GUARD DISABLED for this session: %s Operating on layers 1+2 "
+                "(bounds + bounded torque) alone for guarded moves -- stall detection "
+                "is off. This is the degrade-safely path: a one-shot move does not "
+                "fail closed the way calibration does.",
+                report.reason,
+            )
+        return self._vision_healthy
 
     def move(
         self,
@@ -296,7 +375,12 @@ class SafetyLayer:
         max_delta = max((abs(targets[k] - starts[k]) for k in targets), default=0)
         steps, step_duration = self.plan_ramp(max_delta, duration_ms)
 
-        frame_before = guard.capture() if guard is not None and guard.available() else None
+        guard_usable = (
+            guard is not None
+            and guard.available()
+            and self._vision_guard_is_healthy(guard)
+        )
+        frame_before = guard.capture() if guard_usable else None
 
         with self._lock:
             for step in range(1, steps + 1):
@@ -328,7 +412,7 @@ class SafetyLayer:
                 if wait:
                     time.sleep(step_duration / 1000.0 + config.SETTLE_MARGIN_MS / 1000.0)
 
-        if guard is not None and guard.available() and frame_before is not None:
+        if guard_usable and frame_before is not None:
             frame_after = guard.capture()
             moved_names = [n for n, t in targets.items() if t != starts[n]]
             servo_ids = [config.resolve_servo(n) for n in moved_names]

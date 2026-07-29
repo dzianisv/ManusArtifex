@@ -76,11 +76,17 @@
     "gripper_note": "NEVER command servo 1 (GRIP) below 1500 under any circumstance -- this is documentation only. The real enforcement is the hardcoded ELECTRICAL_LIMITS[1] floor in robohand/config.py, which cannot be widened by editing this file. robohand.config raises at import time if this value and the hardcoded one disagree."
   },
   "vision": {
-    "roi": [0.15, 0.1, 0.7, 0.8],
-    "roi_comment": "Fractional [x, y, w, h] region of interest around the arm, in already-captured frame coordinates. Recalibrate for your camera placement.",
+    "roi": [0, 0, 1.0, 1.0],
+    "roi_comment": "Fractional [x, y, w, h] = [0,0,1.0,1.0] = the WHOLE 1280x720 frame, no cropping (guard._resolve_roi treats values in (0,1] as frame fractions, so this maps to x=0,y=0,w=1280,h=720). The camera mount was improved and now frames the ENTIRE arm -- base, all links, and the gripper -- well lit; full-frame raw-absdiff is now sufficient on its own (no-motion noise 454/577 changed px vs SHOULDER_PAN 78,116 = 135x, GRIP 25,746 = 45x; see docs/verification-camera.md 'Full-arm-in-frame measurement'). A narrower ROI (e.g. one excluding room background) remains available via `robohand camera-check --roi X Y W H` and would further widen the GRIP margin, but is NOT required for correct operation and is NOT the shipped default -- the full-frame numbers already comfortably clear the gate. If the camera or arm mount is ever moved again, re-measure the ROI and thresholds with `robohand camera-check`. Values >1 are absolute pixels; values in (0,1] are fractions of the frame. The obsolete narrow dark-corner-only ROI was [0,300,520,420].",
     "diff_threshold": 25,
-    "min_changed_pixels": 150,
-    "blur_ksize": 5
+    "min_changed_pixels": 3000,
+    "min_changed_pixels_comment": "Site-specific for THIS arm+camera in the NEW full-arm-in-frame setup. 3000 sits ~5.2x above the worst observed no-motion sample (577 changed px, full-frame raw absdiff, 20-warmup/8-flush protocol matching camera.py) and ~8.6x below the worst-case real motion signal (GRIP, 25,746 changed px -- the joint with the smallest visual signature and the one damaged in the original incident). It sits close to the geometric mean of the two (sqrt(577*25746) ~= 3,854), comfortably separated from both noise and the weakest real signal on a log scale. diff_threshold=25 matches the operator's absdiff>25 protocol. robohand/config.py's generic fallback stays at 150 for OTHER unmeasured deployments -- only this live config carries the measured value.",
+    "blur_ksize": 5,
+    "health_frames": 15,
+    "health_interval_s": 0.8,
+    "health_margin": 1.5,
+    "health_separation": 3.0,
+    "health_comment": "Camera-health gate (robohand/camera_health.py). health_interval_s (0.8) and health_frames (15) validated in a prior round (spans more of any auto-exposure hunting cycle; surfaces a higher, more honest noise floor). health_margin (1.5): required = 1.5 * 577 ~= 865.5, comfortably below the 3000 threshold (a further ~3.5x buffer beyond the bare minimum) -- so the default config PASSES comfortably in the new good setup while still rejecting a genuine exposure-hunting/dark-scene regression (any noise floor above ~3000/1.5 ~= 2000 makes required exceed 3000 -> FAIL). health_separation (3.0): floor = 3 * 577 ~= 1731; GRIP's real motion (25,746) clears it by ~14.9x, so the visibility check also passes comfortably. See docs/verification-camera.md 'Full-arm-in-frame measurement'."
   },
   "gripper": {
     "step": 40,

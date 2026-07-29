@@ -45,3 +45,32 @@ def test_vision_guard_is_a_noop_without_a_camera():
     calls = []
     guard.check(None, None, on_stall=lambda: calls.append(True))
     assert calls == []
+
+
+def test_stall_detected_is_reexported_from_safety():
+    """``StallDetected`` is defined in ``guard`` but is naturally caught next to the
+    Layer-1 refusals, so ``except safety.StallDetected`` must work and must refer to
+    the SAME class object -- otherwise an ``except`` on one path silently fails to
+    catch the other. Previously raised AttributeError.
+    """
+    import robohand.guard
+    import robohand.safety
+
+    assert robohand.safety.StallDetected is robohand.guard.StallDetected
+
+    # the `from X import Y` spelling must resolve too
+    from robohand.safety import StallDetected as FromSafety
+
+    assert FromSafety is robohand.guard.StallDetected
+
+    # and it must actually catch a real raise
+    with pytest.raises(robohand.safety.StallDetected):
+        raise robohand.guard.StallDetected("boom")
+
+
+def test_safety_still_raises_attributeerror_for_unknown_names():
+    """The module __getattr__ must not turn every typo into a silent success."""
+    import robohand.safety
+
+    with pytest.raises(AttributeError):
+        robohand.safety.NoSuchThing

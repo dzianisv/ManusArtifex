@@ -379,6 +379,107 @@ whole point of this mechanism.
 
 ---
 
+## The camera-health gate (pre-flight noise floor)
+
+The observer-reliability burst above catches the **false-negative** fault: an
+observer that *misses* real motion. It is triggered only after `confirmations`
+consecutive *no-motion* reports, so it is structurally blind to the opposite,
+equally dangerous fault — an observer that reports **motion on every frame,
+including frames with none.**
+
+That is exactly what an auto-exposure camera in a dark scene does (see the
+`### Lighting` failure mode below). On the real deployment camera (macOS
+AVFoundation, exposure unlockable, dark scene) the originally-reported numbers were
+a genuine 2-second SHOULDER_PAN move at ~46,000 changed pixels versus two frames
+captured with **zero commanded motion** at 268,000–550,000 — noise 6–12× *larger*
+than the real signal. (Those magnitudes were additionally inflated and destabilised
+by a since-fixed capture-staleness bug in `camera.Camera.grab`. The **authoritative**
+operator re-measurement, through the corrected 15-warmup / 8-flush / 0.8 s-interval
+protocol with the ROI `(0,300,520,420)`, puts the honest raw+ROI no-motion floor at
+**≈ 99 changed px** against a **33,615-px** real move — a **340×** separation, the
+best of every metric tried. The *failure mode* — noise floor at or above the
+threshold in adverse lighting or a busy room — is real regardless. See
+`docs/verification-camera.md`, "Operator re-measurement".) When the noise swamps the
+signal the observer
+answers "moved" to every step, `consecutive_misses` never accumulates, the
+reliability burst never fires, and `_search_direction` walks straight to the
+absolute rail on every joint — reproducing the 2026-07-28 incident once per joint,
+on every run.
+
+So before **any** joint is touched, `calibrate()` runs a blocking pre-flight
+(`robohand/camera_health.py`):
+
+```
+  capture N frames, arm dead still, no torque at all
+      f0   f1   f2   ...   fN          (spaced to span an exposure-hunt cycle)
+       \  /  \  /        \  /
+       s01   s12   ...   s(N-1)N       score every consecutive pair
+                                       => the observer's OWN no-motion noise floor
+  require:  motion_threshold  >=  p95(noise) x margin
+  else:     raise CameraUnusableError, unload, write nothing
+```
+
+It measures the observer's no-motion noise floor directly (p95 of the
+changed-pixel score over consecutive passive pairs) and requires the
+motion-detection threshold (`VISION_MIN_CHANGED_PIXELS`) to sit above it by a
+safety `margin`. If it does not, the camera cannot tell a real move from its own
+noise, and the run refuses to start. `CameraUnusableError` is an `ObserverError`
+subclass, so every existing fail-closed `except ObserverError` site treats it the
+same way. No motion is commanded, so on failure nothing has moved and — like
+every other abort — **no file is written.**
+
+**Visibility spot-check.** A pure noise-floor check cannot catch a camera pointed
+at a wall (near-zero noise *and* near-zero signal trivially "passes"). So each
+`_search_direction` piggy-backs on the move it *already* makes to `_start_position`
+— capturing a frame either side of that existing move (zero extra torque, zero
+extra packets) and requiring its score to clear the measured noise floor by a
+`separation` factor. This is an honest spot-check tied to whatever motion happens
+to occur, **not** an exhaustive per-joint visibility certificate; when no start
+move happens, or the noise floor was unmeasurable (a synthetic/noise-free
+observer under `--sim`), it degrades to a no-op rather than fabricating a pass.
+
+**Defaults** (all overridable in `config.json`'s `vision` section). The
+`robohand/config.py` code-level fallbacks are generic; the live
+`robohand/data/config.json` for **this** arm+camera carries the operator-measured,
+site-specific values (see `docs/verification-camera.md`, "Operator re-measurement"):
+
+| key | code fallback | live config.json | meaning |
+|---|---|---|---|
+| `min_changed_pixels` | 150 | **3000** | motion threshold; ~5.2× above the worst no-motion sample (577) and ~8.6× below the worst-case real move (GRIP, 25,746), near the geometric mean √(577·25746) ≈ 3,854 |
+| `roi` | `[0.15,0.1,0.7,0.8]` (fractional) | **`[0,0,1.0,1.0]`** (fractional = full frame) | the camera now frames the whole arm; full-frame absdiff is sufficient, no cropping needed |
+| `health_frames` | 15 | 15 | passive frames sampled for the noise floor |
+| `health_interval_s` | 0.4 | **0.8** | spacing (15 × 0.8 ≈ 12 s — spans an auto-exposure hunting cycle) |
+| `health_margin` | 1.5 | 1.5 | required = 1.5 × 577 ≈ 865.5, comfortably below the 3000 threshold (~3.5× buffer) |
+| `health_separation` | 3.0 | 3.0 | a known-real move must score ≥ 3 × p95 noise (GRIP clears the 3×577≈1731 floor by ~14.9×) |
+| `diff_threshold` | 25 | 25 | grey-level change per pixel (matches the operator's `absdiff>25`) |
+| `normalize` | `none` | `none` | raw absdiff is the confirmed-best metric; `zscore` is an unused opt-in |
+
+**Honest limits.** This is a *point-in-time* check: it runs once, before the
+search, and cannot see lighting that degrades *after* it passed (a cloud moving,
+a monitor waking, someone turning off a lamp mid-run). The per-step reliability
+burst and torque/stall budgets remain the only protection past that point. It
+also cannot certify a joint whose motion is genuinely near-invisible from the
+camera angle beyond the single start-move spot-check. And on a camera that
+*can* lock exposure the whole failure mode does not arise — the gate then simply
+passes cheaply. Use `robohand camera-check` to measure and tune before trusting a
+run (`--roi X Y W H` to experiment with framing, `--before/--after` to measure a
+known move's separation); see `docs/verification-camera.md` for the measured numbers.
+
+**✅ The camera now frames the whole arm.** The mount was improved: **all six joints
+— base, links, and GRIP — are in the full 1280×720 frame, well lit**, so full-frame
+operation is the shipped default (`roi=[0,0,1.0,1.0]`) and vision-guided calibration
+is now meaningful for every joint, including GRIP (25,746 changed px, 45× over the
+noise floor — the worst-case joint, and the one damaged in the original incident).
+*(Superseded situation, kept for the record: an earlier mount could see **only**
+SHOULDER_PAN's rotating base in a dark corner; the ROI could not fix a joint the
+camera physically could not see. That was resolved by physically re-aiming the
+camera — see `docs/verification-camera.md`, "Full-arm-in-frame measurement".)* The
+ROI still cannot frame a joint that is out of shot, so if the camera or mount is ever
+moved, re-measure with `robohand camera-check`; a narrower ROI remains available as
+an optional hardening step but is not required.
+
+---
+
 ## Abort conditions
 
 Any of these aborts the run:
@@ -389,6 +490,9 @@ Any of these aborts the run:
 - wall-clock cap exceeded (`max_wall_clock_s`);
 - the observer raises, or has no frame available;
 - the observer fails the reliability burst;
+- the observer fails the pre-flight camera-health gate — its no-motion noise
+  floor swamps the motion threshold (`CameraUnusableError`), checked before any
+  motion;
 - too many ambiguous observations across the run (`max_ambiguous_observations`);
 - `SafetyLayer` refuses a step (`SafetyViolation`, `PositionOutOfRange`,
   `CalibrationRequired`, ...) — surfaced, never swallowed;
@@ -560,6 +664,15 @@ answer — that is the intended outcome, and it means **some joints are simply n
 calibratable from a given camera position.** Move the camera, or calibrate that
 joint by hand.
 
+On **this** deployment's improved mount the **entire arm is now in frame**, so all
+six joints — including `GRIP`, `WRIST_ROLL`, `WRIST_FLEX`, `ELBOW`, `SHOULDER_LIFT`,
+and `SHOULDER_PAN` — are vision-calibratable by default. *(Superseded: an earlier
+mount could see **only** SHOULDER_PAN's base, with the others physically out of
+shot; that was resolved by re-aiming the camera.)* The general caveat above still
+holds — a joint rotating end-on to the camera moves few pixels — so if the camera or
+mount is moved again, re-measure with `robohand camera-check`. See
+`docs/verification-camera.md`, "Full-arm-in-frame measurement".
+
 ### Lighting
 
 Auto-exposure, auto-white-balance, a cloud, a monitor changing, someone walking
@@ -569,6 +682,13 @@ stepping, and can walk into a stop for more steps than intended. The
 per-step torque bound and the aggregate stall budget cap the damage; they do
 not prevent the wrong reading. Fixed lighting and a locked-exposure camera are
 a real requirement, not a nicety.
+
+The **camera-health gate** (see "The camera-health gate" above) now measures this
+noise floor before the run starts and refuses to proceed when it swamps the
+threshold, converting the worst case (a silent walk to the rail on every joint)
+into a loud, file-less `CameraUnusableError`. It is a point-in-time pre-flight,
+though — lighting that degrades *after* it passes is still only bounded by the
+torque/stall budgets, not prevented. Run `robohand camera-check` first.
 
 ### Gravity sag after unload
 

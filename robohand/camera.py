@@ -4,8 +4,10 @@ Wraps OpenCV's AVFoundation backend (macOS) so the arm's workspace can be
 observed by the built-in FaceTime camera, an external USB webcam, or an
 iPhone via Continuity Camera. Handles the macOS quirks that trip up naive
 ``cv2.VideoCapture`` usage: warm-up frames that come back dark/garbage,
-permission prompts on first access, and camera indices that shift when
-devices are plugged/unplugged.
+permission prompts on first access, camera indices that shift when devices
+are plugged/unplugged, and -- critically for the motion-differencing done
+downstream -- **stale buffered frames returned by a single ``read()`` after a
+time gap** (see :attr:`CameraConfig.flush_reads`).
 
 See docs/camera.md for setup, camera-selection, and calibration notes.
 """
@@ -95,7 +97,26 @@ class CameraConfig:
     width: Optional[int] = None
     height: Optional[int] = None
     fps: Optional[float] = None
-    warmup_frames: int = 8
+    # One-time settle after ``open()``: AVFoundation returns dark/garbage frames
+    # for the first reads, especially right after a permission grant. Raised from
+    # 8 to 20 after the 2026-07-28 capture-staleness investigation (see
+    # ``flush_reads`` and docs/verification-camera.md): 20 reads reliably clears
+    # the open-time exposure/auto-focus settle a real-hardware session independently
+    # confirmed (docs/hardware-fault-servo5.md).
+    warmup_frames: int = 20
+    # Per-``grab()`` staleness flush: reads discarded immediately before the frame
+    # ``grab()`` returns. AVFoundation buffers frames, so a *single* ``read()`` after
+    # a time gap (exactly what happens between a move's before/after frames, and
+    # between the camera-health noise-floor samples that sleep ``interval_s`` apart)
+    # can hand back a stale frame captured seconds earlier. Diffed against a fresh
+    # frame that inflates and destabilises the measured "no-motion" noise -- the
+    # mechanism behind the wildly unstable noise floor the original report saw. Discarding
+    # ``flush_reads`` frames drains the buffer so ``grab()`` returns the freshest
+    # frame. 8 removes the artifact here (median no-motion noise dropped ~20x, 22->1
+    # changed px, lighting held constant) and matches the recipe an independent
+    # real-hardware session validated (docs/verification-camera.md,
+    # docs/hardware-fault-servo5.md). Never ship 0 -- that is the original bug.
+    flush_reads: int = 8
     max_retries: int = 10
     retry_delay_s: float = 0.1
     open_timeout_s: float = 5.0
@@ -196,16 +217,31 @@ class Camera:
         ch = max(1, min(ch, h - y))
         return frame[y : y + ch, x : x + cw]
 
+    def _flush_stale(self) -> None:
+        """Discard ``flush_reads`` frames to drain AVFoundation's stale buffer.
+
+        Called at the start of every :meth:`grab` so the frame it returns is the
+        freshest available, not one buffered seconds ago. This is what keeps the
+        downstream frame-differencing (``guard.VisionGuard`` / the camera-health
+        noise floor) from mistaking capture staleness for scene motion. See
+        :attr:`CameraConfig.flush_reads` and docs/verification-camera.md.
+        """
+        assert self._cap is not None
+        for _ in range(self.config.flush_reads):
+            self._cap.read()
+
     def grab(self) -> np.ndarray:
         """Read one frame, retrying on transient decode failures.
 
-        Raises ``CameraError`` if no usable frame is produced after
-        ``max_retries`` attempts (e.g. camera disconnected, or permission
-        was never granted).
+        Drains ``flush_reads`` stale buffered frames first (see
+        :meth:`_flush_stale`) so the returned frame is fresh. Raises
+        ``CameraError`` if no usable frame is produced after ``max_retries``
+        attempts (e.g. camera disconnected, or permission was never granted).
         """
         if self._cap is None:
             self.open()
         assert self._cap is not None
+        self._flush_stale()
         last_err = "unknown error"
         for attempt in range(self.config.max_retries):
             ok, frame = self._cap.read()

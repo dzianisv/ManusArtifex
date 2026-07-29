@@ -43,6 +43,109 @@ def _make_arm(args: argparse.Namespace) -> Arm:
     return Arm(sim=getattr(args, "sim", False), dry_run=getattr(args, "dry_run", False))
 
 
+def _open_camera_observer(roi=None):
+    """Open camera index 0 and wrap it in a ``VisionMotionObserver``.
+
+    Returns ``(camera, observer)`` or ``(None, None)`` when no camera can be opened
+    (not attached, permission denied, cv2/numpy missing, wrong backend). This is
+    camera-only -- it never touches the HID device or commands any motion -- so
+    ``camera-check`` and ``doctor`` can run it with no arm and no operator gate. The
+    caller owns the returned camera and must ``release()`` it. Tests monkeypatch this
+    function so the automated suite never touches real hardware.
+
+    ``roi`` (``(x, y, w, h)``, pixel or fractional) overrides ``config.VISION_ROI``
+    for a single diagnostic run -- the primary "aim the camera" knob exposed by
+    ``camera-check --roi`` so an operator can experiment without editing config.json.
+    """
+    try:
+        from . import camera as camera_module
+        from .guard import VisionGuard
+        from .observer import VisionMotionObserver
+    except Exception:  # pragma: no cover - optional dependency (cv2/numpy) missing
+        return None, None
+    try:
+        cam = camera_module.Camera(camera_module.CameraConfig(index=0))
+        cam.open()
+    except Exception:  # CameraError or anything else -- no camera, degrade gracefully
+        return None, None
+    guard = VisionGuard(
+        frame_source=cam.grab,
+        roi=roi if roi is not None else config.VISION_ROI,
+        diff_threshold=config.VISION_DIFF_THRESHOLD,
+        min_changed_pixels=config.VISION_MIN_CHANGED_PIXELS,
+        blur_ksize=config.VISION_BLUR_KSIZE,
+        normalize=config.VISION_NORMALIZE,
+        normalized_threshold=config.VISION_NORMALIZED_THRESHOLD,
+    )
+    return cam, VisionMotionObserver(guard)
+
+
+class CameraCheckError(RuntimeError):
+    """A diagnostic input error in ``camera-check`` (e.g. an unreadable evidence
+    image) that should exit cleanly with a message, not a traceback."""
+
+
+def _load_motion_probe(before_path: str, after_path: str):
+    """Build a ``motion_probe`` callable from two on-disk image files.
+
+    Reads *only* from disk via ``cv2.imread`` -- it never touches the HID device or
+    commands any motion. Both frames are loaded eagerly so a missing/unreadable file
+    raises ``CameraCheckError`` immediately (clean message, no traceback) before any
+    camera is opened. The returned callable hands the same two frames to
+    ``camera_health.assess_camera_health``'s ``motion_probe`` hook, which scores them
+    through the observer's guard (so the active ROI applies to them too).
+    """
+    try:
+        import cv2
+    except Exception as e:  # pragma: no cover - optional dependency missing
+        raise CameraCheckError(f"cannot load evidence images: OpenCV unavailable ({e})")
+    before = cv2.imread(before_path)
+    if before is None:
+        raise CameraCheckError(f"--before image could not be read: {before_path!r}")
+    after = cv2.imread(after_path)
+    if after is None:
+        raise CameraCheckError(f"--after image could not be read: {after_path!r}")
+    return lambda: (before, after)
+
+
+def _camera_health_report(frames: int, interval_s: float, *, roi=None, motion_probe=None):
+    """Run the standalone noise-floor gate against the real camera (no arm, no motion).
+
+    Returns a ``CameraHealthReport``; on a missing camera returns an ``available``-
+    False report rather than raising, so both ``camera-check`` and ``doctor`` degrade
+    gracefully. Never commands motion and never opens the HID device. ``roi`` overrides
+    ``config.VISION_ROI`` for this one run; ``motion_probe`` (when given) is a callable
+    returning a known-real before/after pair whose separation from the live noise
+    floor is measured.
+    """
+    from . import camera_health
+
+    cam, observer = _open_camera_observer(roi=roi)
+    if observer is None:
+        return camera_health.CameraHealthReport(
+            available=False, healthy=False, frames=0, interval_s=interval_s, pairs=0,
+            noise_p50=0.0, noise_p95=0.0, noise_max=0.0,
+            threshold=float(config.VISION_MIN_CHANGED_PIXELS),
+            margin=config.VISION_HEALTH_MARGIN, required_threshold=0.0,
+            normalize=config.VISION_NORMALIZE, skipped=True,
+            reason="no camera could be opened (index 0) -- layer 3 cannot run.",
+        )
+    try:
+        return camera_health.assess_camera_health(
+            observer,
+            frames=frames,
+            interval_s=interval_s,
+            margin=config.VISION_HEALTH_MARGIN,
+            separation=config.VISION_HEALTH_SEPARATION,
+            motion_probe=motion_probe,
+        )
+    finally:
+        try:
+            cam.release()
+        except Exception:  # pragma: no cover - release is best-effort
+            pass
+
+
 def _print_positions(positions: dict, as_json: bool) -> None:
     if as_json:
         print(json.dumps(positions, indent=2))
@@ -448,6 +551,75 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_camera_health(report, *, prefix: str = "") -> None:
+    """Human-readable one-block summary of a ``CameraHealthReport``."""
+    verdict = "PASS" if report.healthy else "FAIL"
+    if not report.available:
+        print(f"{prefix}Camera health: FAIL -- {report.reason}")
+        return
+    print(f"{prefix}Camera health: {verdict}")
+    print(f"{prefix}  frames sampled:   {report.frames} (interval {report.interval_s:g}s, {report.pairs} pairs)")
+    print(f"{prefix}  metric:           normalize={report.normalize}")
+    print(f"{prefix}  no-motion noise:  p50={report.noise_p50:.0f}  p95={report.noise_p95:.0f}  max={report.noise_max:.0f} changed px")
+    print(f"{prefix}  motion threshold: {report.threshold:.0f} changed px")
+    print(f"{prefix}  required (>= p95 x {report.margin:g}): {report.required_threshold:.0f}")
+    if report.headroom is not None:
+        print(f"{prefix}  headroom (threshold / p95 noise): {report.headroom:.1f}x")
+    if report.motion_score is not None:
+        print(f"{prefix}  known-real move:  {report.motion_score:.0f} changed px")
+        if report.motion_separation is not None:
+            print(f"{prefix}  measured separation vs real motion (move / p95 noise): {report.motion_separation:.1f}x")
+        print(f"{prefix}  visibility: {'PASS' if report.separation_ok else 'FAIL'} "
+              f"(need move >= {report.separation_floor:.0f})")
+    if not report.healthy:
+        print(f"{prefix}  reason: {report.reason}")
+
+
+def cmd_camera_check(args: argparse.Namespace) -> int:
+    """Measure the camera's no-motion noise floor and report whether the motion
+    threshold clears it. Opens camera index 0, commands NO motion, needs no arm.
+
+    A human runs this to aim and light the camera *before* ever calibrating: an
+    unlocked-exposure camera in a dark scene hunts continuously, so two frames taken
+    with the arm sitting still can differ by more pixels than a real joint move --
+    which would make auto-calibration walk every joint to its mechanical rail. This
+    is the standalone form of the same gate ``calibrate`` runs internally. Returns 0
+    on PASS, 1 on FAIL (including no camera), 2 on a bad diagnostic input."""
+    frames = args.frames if args.frames is not None else config.VISION_HEALTH_FRAMES
+    interval = args.interval if args.interval is not None else config.VISION_HEALTH_INTERVAL_S
+    roi = tuple(args.roi) if args.roi is not None else None
+
+    motion_probe = None
+    if args.before is not None or args.after is not None:
+        if args.before is None or args.after is None:
+            print("error: --before and --after must be given together (two image files "
+                  "of a known-real move)", file=sys.stderr)
+            return 2
+        try:
+            motion_probe = _load_motion_probe(args.before, args.after)
+        except CameraCheckError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+
+    report = _camera_health_report(frames, interval, roi=roi, motion_probe=motion_probe)
+
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2))
+    else:
+        _print_camera_health(report)
+        if report.healthy:
+            print("Camera is usable for vision-guided calibration.")
+        else:
+            print(
+                "Do NOT rely on vision-guided calibration until this passes. Improve "
+                "lighting, lock/steady exposure, re-aim so the moving joint fills the "
+                "ROI (try --roi X Y W H to experiment), raise vision.min_changed_pixels "
+                "above the noise floor, or enable the brightness-normalised metric "
+                "(config vision.normalize=zscore) and re-run this check."
+            )
+    return 0 if report.healthy else 1
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report device presence, per-joint calibration status, camera availability,
     and which safety layers are currently active. Never commands any motion."""
@@ -477,20 +649,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "effective_range": [lo, hi],
         }
 
-    camera_available = False
-    camera_error = None
+    # Camera + layer-3 health in one pass. Uses a deliberately small, fast sample
+    # (a handful of frames, short interval) so 'doctor' never hangs, and never
+    # raises for a missing/broken camera -- _camera_health_report returns an
+    # available=False report instead. This both reports presence AND whether the
+    # camera can actually tell motion from its own noise (the layer-3 defect the
+    # camera-check gate exists for) -- a camera that is "available" but noise-blind
+    # is worse than useless for calibration, and doctor should say so.
+    DOCTOR_HEALTH_FRAMES = 5
+    DOCTOR_HEALTH_INTERVAL_S = 0.1
     try:
-        from . import camera as camera_module
+        health_report = _camera_health_report(DOCTOR_HEALTH_FRAMES, DOCTOR_HEALTH_INTERVAL_S)
+    except Exception as e:  # doctor must never raise for a camera problem
+        from . import camera_health as _ch
 
-        cam = camera_module.Camera(camera_module.CameraConfig(index=0))
-        cam.open()
-        camera_available = True
-        cam.release()
-    except Exception as e:
-        camera_error = str(e)
+        health_report = _ch.CameraHealthReport(
+            available=False, healthy=False, frames=0, interval_s=DOCTOR_HEALTH_INTERVAL_S,
+            pairs=0, noise_p50=0.0, noise_p95=0.0, noise_max=0.0,
+            threshold=float(config.VISION_MIN_CHANGED_PIXELS), margin=config.VISION_HEALTH_MARGIN,
+            required_threshold=0.0, normalize=config.VISION_NORMALIZE, skipped=True,
+            reason=f"camera health check failed: {e}",
+        )
+    camera_available = health_report.available
+    camera_error = None if camera_available else health_report.reason
     report["camera"] = {"available": camera_available}
     if camera_error:
         report["camera"]["error"] = camera_error
+    report["camera_health"] = health_report.as_dict()
 
     report["safety_layers"] = {
         "layer1_limits_and_calibration": True,
@@ -509,11 +694,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             cal = "calibrated" if info["calibrated"] else "UNCALIBRATED (provisional band)"
             print(f"  {name:<14} {cal:<32} effective={info['effective_range']}")
         print(f"Camera available: {camera_available}" + (f" ({camera_error})" if camera_error else ""))
+        if camera_available:
+            _print_camera_health(health_report)
         print("Safety layers:")
         for k, v in report["safety_layers"].items():
             print(f"  {k}: {'ACTIVE' if v else 'inactive (no camera -- layer 3 skipped)'}")
         if not camera_available:
             print("WARNING: no camera detected -- layer 3 (vision stall detection) will not run.")
+        elif not health_report.healthy:
+            print(
+                "WARNING: camera present but its no-motion noise floor swamps the motion "
+                "threshold -- vision-guided calibration would be unreliable. Run "
+                "'robohand camera-check' and fix lighting/exposure/ROI before calibrating."
+            )
     return 0
 
 
@@ -625,6 +818,32 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="Report device/camera/calibration status and active safety layers")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser(
+        "camera-check",
+        help="Measure the camera's no-motion noise floor vs the motion threshold (no arm, no motion)",
+        description="Opens camera index 0, captures a handful of frames with NOTHING moving, and "
+        "reports whether the motion-detection threshold sits clearly above the camera's own "
+        "no-motion noise floor. Commands no motion and needs no arm -- run it to aim and light "
+        "the camera before auto-calibration. Exits 0 on PASS, 1 on FAIL. See docs/verification-camera.md.",
+    )
+    p.add_argument("--frames", type=int, default=None,
+                   help=f"Frames to sample (default config vision.health_frames = {config.VISION_HEALTH_FRAMES})")
+    p.add_argument("--interval", type=float, default=None,
+                   help="Seconds between frames (default config vision.health_interval_s = "
+                   f"{config.VISION_HEALTH_INTERVAL_S}); space captures out to span an exposure-hunt cycle")
+    p.add_argument("--roi", type=float, nargs=4, metavar=("X", "Y", "W", "H"), default=None,
+                   help="Override the ROI (x y w h; >1 = pixels, <=1 = frame fractions) for this "
+                   f"one run without editing config.json (default vision.roi = {list(config.VISION_ROI)}). "
+                   "The primary 'aim the camera' knob.")
+    p.add_argument("--before", metavar="PATH", default=None,
+                   help="Image file of the scene BEFORE a known-real move (used with --after to "
+                   "measure real motion separation from the live noise floor; reads files only, "
+                   "commands no motion)")
+    p.add_argument("--after", metavar="PATH", default=None,
+                   help="Image file of the scene AFTER the known-real move (used with --before)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_camera_check)
 
     p = sub.add_parser(
         "calibrate",

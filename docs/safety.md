@@ -204,6 +204,8 @@ around that fact, not in denial of it.
      │    • no motion where motion was commanded → unload immediately, raise            │
      │      StallDetected                                                               │
      │    • degrades safely: no camera → skipped, layers 1+2 still enforced, CLI warns  │
+     │    • camera-health gate: noise-blind camera → calibrate() fails closed,           │
+     │      move() degrades safely (treats it as no camera). robohand camera-check       │
      └───────────────────────────────────────────┬────────────────────────────────────┘
                                                   │  (SERVO_MOVE, valid token only)
                           ┌───────────────────────▼────────────────────────┐
@@ -339,6 +341,68 @@ Layers 1/2 to work; it is a strict addition when available.
 caller explicitly asks for it (`use_vision=True`): a real camera pointed at an
 empty desk while a fake transport pretends to move would otherwise report
 every simulated move as a false stall.
+
+### Camera health: fail-closed for calibration, degrade-safely for one-shot moves
+
+A camera can be *present and available* yet still unable to tell a real move from
+its own noise — an auto-exposure sensor in a dark scene hunts continuously, or
+people move elsewhere in the room, so two frames taken with the arm dead still can
+differ by more changed pixels than a real joint move (the originally-reported
+268k–550k vs ~46k magnitudes were inflated by a since-fixed capture-staleness bug;
+the authoritative full-arm-in-frame re-measurement puts the honest full-frame
+no-motion floor at **≈ 577 changed px** vs a **25,746-px** GRIP move and a
+**78,116-px** SHOULDER_PAN move — see `docs/verification-camera.md`).
+`robohand/camera_health.py` measures this no-motion noise floor and compares it to
+the guard's motion threshold. For **this** arm+camera the live `config.json` sets
+`min_changed_pixels=3000` (≈5.2× above the worst 577 noise sample, ≈8.6× below the
+worst-case GRIP move), the full-frame ROI `[0,0,1.0,1.0]`, and a 0.8 s sampling
+interval; the generic `robohand/config.py` fallbacks (150 / fractional ROI / 0.4 s)
+are left untouched for other deployments. Two callers use that verdict, on purpose,
+in **opposite** ways:
+
+- **`calibrate()` fails closed.** Calibration *infers mechanical stops from "no
+  motion"*, so a noise-blind observer would fabricate limits (or walk to the
+  rail). Per this repo's "refuse rather than guess" rule for calibration, the
+  pre-flight gate raises `CameraUnusableError`, unloads, and writes nothing. See
+  `docs/calibration.md`.
+- **`SafetyLayer.move()` degrades safely.** A one-shot move (a pose, a grip-ladder
+  step) is already protected by Layers 1+2; the vision check is a strict addition.
+  Per the degrade-safely convention documented on `observer.VisionMotionObserver`
+  ("A no-op is the right degrade-safely behaviour for a one-shot move guarded by
+  layers 1+2; it is the *wrong* behaviour for calibration"), a *proven-unhealthy*
+  camera is treated exactly like *no* camera: log one loud `WARNING` and keep
+  operating on Layers 1+2. Hard-failing every move on a noisy camera would be a
+  denial-of-service on the whole arm for a layer that is, by design, optional.
+
+**Cost/tradeoff.** `move()` computes this verdict **lazily and once** — the first
+time a guarded move actually uses the guard — and caches it on the `SafetyLayer`
+instance (`_vision_health_checked` / `_vision_healthy`). That keeps the N-frame
+sample out of construction and out of every subsequent move, so it adds no
+per-call cost on hardware and cannot perturb the many call-count/timing assertions
+in the test suite (later synthetic moves reuse the cached verdict; a noise-free
+synthetic frame source is always judged healthy). The sample uses a zero sleep
+interval, so it adds no wall-clock time either; consecutive real-camera grabs
+still sample genuine frame-to-frame exposure hunting. The tradeoff is honest: the
+verdict is point-in-time (a session that starts in good light and dims later keeps
+its cached "healthy") and, at zero interval, samples a shorter window than the
+`camera-check` CLI, so it catches the *gross* swamping fault, not a marginal one.
+For a rigorous check, run `robohand camera-check` (or `robohand doctor`) before a
+session. `camera-check` also accepts `--roi X Y W H` to experiment with framing and
+`--before/--after` two image files to measure a known move's separation, and prints
+an explicit **headroom** ratio (threshold ÷ live p95 noise).
+
+**✅ Camera coverage: the whole arm is now framed.** The mount was improved so **all
+six joints — base, links, and GRIP — are in the full 1280×720 frame, well lit**;
+Layer 3 now adds real protection for every joint, including GRIP (25,746 changed px,
+45× over the noise floor — the worst-case joint and the one damaged in the original
+incident). *(Superseded situation, kept for the record: an earlier mount framed the
+rotating base only, so **SHOULDER_PAN** was the sole joint in view and the others
+were physically out of frame; no ROI setting could fix that — it was resolved by
+physically re-aiming the camera.)* A healthy camera still only proves it can tell
+motion from noise *in the part of the scene it frames*, so if the camera or mount is
+moved again, re-measure with `robohand camera-check`; a narrower ROI remains an
+optional hardening step, not a requirement (see `docs/verification-camera.md`,
+"Full-arm-in-frame measurement", and `docs/calibration.md`).
 
 ### Gripper-specific: the incremental grip ladder
 
