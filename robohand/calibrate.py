@@ -159,21 +159,68 @@ class CalibrationSettings:
     max_steps_per_direction: int = 64
 
     #: Cumulative commanded torque time over the whole run, all joints.
-    max_torque_ms: int = 120_000
+    #:
+    #: Derived, not guessed. Per joint and direction the search commands at most:
+    #:   * ``ceil(rail_span_from_centre / step)`` probe packets. The widest rail
+    #:     half-span is ``1500 -> 700`` = 800 units, so ``ceil(800/30)`` = 27.
+    #:   * ``verification_moves`` (6) reliability-verification packets.
+    #:   * 1 retreat/settle packet.
+    #: = 34 packets per direction, 68 for both. Re-centring between and after the
+    #: directions crosses up to the full 800-unit half-span, which
+    #: ``SafetyLayer`` ramps into ``ceil(800/300)`` = 3 packets, twice = 6.
+    #: => 74 packets/joint x 6 joints x 400ms = 177,600ms. Rounded to 180,000 to
+    #: absorb an odd extra settle packet. Measured worst case (a real stop placed
+    #: as deep inside the rail as it can be on every joint and direction, so every
+    #: probe sweep AND every verification burst runs in full): 151,600ms. A
+    #: realistic ``--all`` against ``sim.DEFAULT_MECHANICAL_LIMITS``: 137,600ms --
+    #: which already blew the pre-fix 120,000ms default, because before the
+    #: ``search_bounds`` fix the search could only ever crawl over the 300-unit
+    #: provisional band and never had to sweep out to the rail.
+    max_torque_ms: int = 180_000
 
     #: Cumulative simulated stall time. Only enforceable against ``SimTransport``
     #: (real hardware cannot report stalls -- that is the entire problem this
     #: package exists to work around), so on hardware this is unenforced by
     #: construction, not merely unset.
-    max_stall_ms: int = 6_000
+    #:
+    #: Derived: stall accrues *only* while the commanded target is beyond the true
+    #: mechanical stop, and once a step overshoots the stop the joint is pinned, so
+    #: every later step in that direction is a no-motion miss and the direction
+    #: terminates after ``confirmations`` of them. Worst case per direction is
+    #: therefore ``1`` overshoot-that-still-moved ``+ confirmations`` (2) = 3
+    #: stalling packets -- a number set by ``confirmations``, NOT by how far the
+    #: search is allowed to travel. Widening the search to the absolute rail
+    #: multiplies the *number of steps* but not the *number of stalling steps*.
+    #: => 6 joints x 2 directions x 3 packets x 400ms = 14,400ms.
+    #: Measured worst case: 14,000ms. Realistic ``--all``: 10,400ms.
+    max_stall_ms: int = 14_400
 
-    #: Wall-clock cap for the whole run.
+    #: Wall-clock cap for the whole run. Each packet costs
+    #: ``step_duration_ms + config.SETTLE_MARGIN_MS`` (500ms) plus observation
+    #: time, so the 444-packet ceiling above is ~222s of commanding. Measured
+    #: worst case end to end under ``--sim``: 191.9s; realistic ``--all``: 174.2s.
+    #: 900s leaves room for a real camera observer, which is far slower per
+    #: observation than ``SimMotionObserver``, without being so loose that a hung
+    #: run sits on the arm indefinitely.
     max_wall_clock_s: float = 900.0
 
     #: A no-motion report that a later observation contradicts (the joint moved
     #: again afterwards) is an *ambiguous* observation. A handful means a twitchy
     #: camera; a lot means the observer is not trustworthy enough to calibrate with.
-    max_ambiguous_observations: int = 8
+    #:
+    #: This is a run-wide count, and it had to be re-derived when the search was
+    #: widened to the absolute rail: a single joint now makes roughly twice as many
+    #: observations as it did over the old 300-unit provisional band (~64 vs ~28),
+    #: so leaving the cap at 8 would have silently halved the observer error rate
+    #: the design intended to tolerate. 16 restores it. Measured: a camera that
+    #: drops one genuine motion report in seven produces 6 ambiguous observations
+    #: over one joint.
+    #:
+    #: Note this is a backstop, not the primary defence. The observer-reliability
+    #: burst (``verification_moves`` / ``max_verification_misses``) is far stricter
+    #: and fires first: a 1-in-5 dropper is rejected by that gate long before this
+    #: counter matters.
+    max_ambiguous_observations: int = 16
 
     def __post_init__(self) -> None:
         def _int(name: str, value: Any, lo: int, hi: int) -> None:
@@ -410,7 +457,18 @@ def _torque_burst(arm, name: str, target: int, settings: CalibrationSettings, bu
     it, even with the override applied. It is still audited, still requires the
     override + reason below, and is still subject to ``SafetyLayer``'s
     unconditional absolute-rail backstop.
+
+    The budget is charged the *actual* commanded torque, not one nominal burst.
+    A probe step is 30 units and is always a single packet, but the re-centering
+    move between the two search directions can span the full rail (800 units) and
+    ``SafetyLayer`` ramps anything over ``max_step_per_move`` into several packets,
+    each of at least ``config.MIN_DURATION_MS``. Charging one burst for those would
+    under-count by up to 2x and make ``max_torque_ms`` a budget for something other
+    than what the servos were actually told to do.
     """
+    start = arm._shadow.get(name)
+    delta = 0 if start is None else abs(int(target) - int(start))
+    packets, packet_ms = arm._safety.plan_ramp(delta, settings.step_duration_ms)
     arm.set_position(
         name,
         target,
@@ -426,7 +484,7 @@ def _torque_burst(arm, name: str, target: int, settings: CalibrationSettings, bu
     # which additionally erases the shadow position estimate that SafetyLayer needs
     # to decide ramping for the next step.
     arm._safety.unload([name])
-    budget.charge_torque(settings.step_duration_ms)
+    budget.charge_torque(packets * packet_ms)
 
 
 def _observe(observer: MotionObserver, before, after, context: str) -> bool:

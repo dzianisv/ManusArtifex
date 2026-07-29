@@ -137,6 +137,20 @@ class SafetyLayer:
             return config.absolute_bounds(key)
         return config.effective_bounds(key, allow_uncalibrated_override=allow_uncalibrated_override)
 
+    def plan_ramp(self, max_delta: int, duration_ms: int) -> tuple:
+        """How ``move()`` will split a move of ``max_delta`` units into packets.
+
+        Returns ``(packet_count, per_packet_duration_ms)``. Exposed because
+        ``move()`` is the authority on ramping and callers that need to *account*
+        for the torque a move will command (``calibrate._Budget``) must not
+        reimplement this arithmetic and drift out of sync with it. ``move()``
+        itself calls this, so there is exactly one copy.
+        """
+        duration_ms = max(int(duration_ms), config.MIN_DURATION_MS)
+        delta = abs(int(max_delta))
+        steps = max(1, -(-delta // self.max_step_per_move)) if delta else 1
+        return steps, max(config.MIN_DURATION_MS, duration_ms // steps)
+
     def move(
         self,
         positions: Mapping[str, int],
@@ -280,7 +294,7 @@ class SafetyLayer:
 
 
         max_delta = max((abs(targets[k] - starts[k]) for k in targets), default=0)
-        steps = max(1, -(-max_delta // self.max_step_per_move)) if max_delta else 1
+        steps, step_duration = self.plan_ramp(max_delta, duration_ms)
 
         frame_before = guard.capture() if guard is not None and guard.available() else None
 
@@ -309,7 +323,6 @@ class SafetyLayer:
                             name, raw_pos, pos, lo, hi, abs_lo, abs_hi,
                         )
                     id_positions.append((config.resolve_servo(name), pos))
-                step_duration = max(config.MIN_DURATION_MS, duration_ms // steps)
                 self._transport.move_servos(id_positions, step_duration, token=self._mint_token())
                 self._note_activity(id_positions, step_duration)
                 if wait:

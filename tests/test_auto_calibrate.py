@@ -660,6 +660,131 @@ def test_wall_clock_abort_writes_nothing(tmp_path, fast):
     assert list(tmp_path.glob("calibration-*.json")) == []
 
 
+def test_stall_budget_abort_writes_nothing(tmp_path, fast):
+    """The stall budget must also fail closed, not just the torque one.
+
+    ``max_stall_ms=0`` means "the first command that pushes against anything ends
+    the run". ELBOW's simulated stop at 850 is inside the rail, so the sweep will
+    reach it and the very next step will stall.
+    """
+    settings = calibration.CalibrationSettings(step_duration_ms=20, max_stall_ms=0)
+    with make_arm({4: (850, 2150)}) as arm:
+        with pytest.raises(calibration.CalibrationAborted, match="stall"):
+            calibration.calibrate(
+                arm, ["ELBOW"], settings=settings,
+                observer=SimMotionObserver(arm._transport), output_dir=tmp_path,
+            )
+        assert arm._transport.any_torque_on() is False
+    assert list(tmp_path.glob("calibration-*.json")) == []
+
+
+def test_torque_accounting_equals_what_the_transport_was_actually_told_to_do(fast):
+    """``budget.torque_ms`` must be the real commanded time, not a proxy for it.
+
+    ``_torque_burst`` charges the budget for ``packets x per_packet_duration`` as
+    computed by ``SafetyLayer.plan_ramp``, because a single ``set_position`` whose
+    delta exceeds ``max_step_per_move`` is silently ramped into several packets.
+    Charging one ``step_duration_ms`` per call -- as the pre-fix code did -- would
+    under-count the re-centering moves, which the widened search made much longer,
+    and would turn ``max_torque_ms`` into a budget for something other than torque.
+
+    Assert exact equality against the transport log: no fudge factor.
+    """
+    settings = calibration.CalibrationSettings(step_duration_ms=20)
+    with make_arm({4: (850, 2150)}) as arm:
+        run = calibration.calibrate(
+            arm, ["ELBOW"], settings=settings,
+            observer=SimMotionObserver(arm._transport), write=False,
+        )
+        commanded = sum(e["duration_ms"] for e in arm._transport.log if e["cmd"] == "MOVE")
+    assert run.torque_ms == commanded, (
+        f"torque accounting is off: charged {run.torque_ms}ms, actually commanded {commanded}ms"
+    )
+    # And the run really did contain a ramped (multi-packet) move, so the test is
+    # not passing vacuously on a run where every move happened to be one packet.
+    assert commanded > run.joints["ELBOW"].steps_min * settings.step_duration_ms
+
+
+@pytest.mark.parametrize("near_stop,far_stop", [((1330, 1670), (850, 2150))])
+def test_stall_time_is_driven_by_confirmations_not_by_search_span(near_stop, far_stop, fast):
+    """The load-bearing claim behind the stall budget.
+
+    Widening the search to the absolute rail multiplies the number of *steps*, but
+    NOT the number of *stalling* steps. Stall accrues only while the commanded
+    target is past the true stop; the first such command pins the joint there, so
+    every later step in that direction is a no-motion miss and the direction ends
+    after ``confirmations`` of them.
+
+    Two arms, identical except that one's stop is 170 units from centre and the
+    other's is 650 (nearly 4x the sweep, and outside the old provisional band),
+    must therefore accrue *identical* stall time.
+    """
+    settings = calibration.CalibrationSettings(step_duration_ms=20)
+    stalls = []
+    steps = []
+    for limits in (near_stop, far_stop):
+        with make_arm({4: limits}) as arm:
+            run = calibration.calibrate(
+                arm, ["ELBOW"], settings=settings,
+                observer=SimMotionObserver(arm._transport), write=False,
+            )
+            stalls.append(arm._transport.stall_ms_total())
+            steps.append(run.joints["ELBOW"].steps_min)
+
+    assert steps[1] >= steps[0] * 3, (
+        f"the far-stop case should sweep far more steps: {steps}"
+    )
+    assert stalls[0] == stalls[1], (
+        f"stall time tracked the search span, which breaks the budget derivation: {stalls}"
+    )
+    expected = 2 * (1 + settings.confirmations) * settings.step_duration_ms
+    assert stalls[0] == expected, f"expected {expected}ms of stall, got {stalls[0]}ms"
+
+
+def test_default_budgets_cover_the_derived_worst_case_all_joint_run():
+    """The shipped defaults must bound the worst case, with the arithmetic shown.
+
+    This is the test that would have caught the pre-fix defaults: widening the
+    search to the rail pushed a realistic ``--all`` run to 137,600ms of commanded
+    torque and 10,400ms of stall, against defaults of 120,000 and 6,000.
+    """
+    s = calibration.CalibrationSettings()
+    joints = len(config.JOINT_LIMITS)
+    assert joints == 6
+
+    # Stall: per direction, at most one overshoot-that-still-moved plus
+    # `confirmations` no-motion steps. Independent of the search span.
+    stall_ceiling = joints * 2 * (1 + s.confirmations) * s.step_duration_ms
+    assert stall_ceiling == 14_400
+    assert s.max_stall_ms >= stall_ceiling, (
+        f"max_stall_ms {s.max_stall_ms} cannot cover the derived worst case {stall_ceiling}"
+    )
+
+    # Torque: per direction, the full centre->rail sweep + verification + retreat;
+    # plus the two re-centring moves, each ramped by max_step_per_move.
+    widest_half_span = max(
+        max(config.JOINT_LIMITS[n].center - lo, hi - config.JOINT_LIMITS[n].center)
+        for n in config.JOINT_LIMITS
+        for lo, hi in [config.absolute_bounds(n)]
+    )
+    probe = -(-widest_half_span // s.step)
+    per_direction = probe + s.verification_moves + 1
+    recentre = 2 * -(-widest_half_span // config.MAX_STEP_PER_MOVE)
+    torque_ceiling = joints * (2 * per_direction + recentre) * s.step_duration_ms
+    assert torque_ceiling == 177_600, torque_ceiling
+    assert s.max_torque_ms >= torque_ceiling, (
+        f"max_torque_ms {s.max_torque_ms} cannot cover the derived worst case {torque_ceiling}"
+    )
+
+    # Wall clock: every packet costs a burst plus a settle, before observation.
+    packets = torque_ceiling // s.step_duration_ms
+    commanding_s = packets * (s.step_duration_ms + config.SETTLE_MARGIN_MS) / 1000.0
+    assert commanding_s == pytest.approx(222.0)
+    assert s.max_wall_clock_s >= commanding_s * 2, (
+        "max_wall_clock_s leaves no room for a real (slow) camera observer"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 4: a flaky observer must not yield a falsely-narrow result
 # ---------------------------------------------------------------------------
