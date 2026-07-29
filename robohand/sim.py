@@ -197,6 +197,14 @@ class SimTransport:
             "duration_ms": duration_ms,
             "ts": time.monotonic(),
             "achieved": {},
+            # Recorded so the "every SERVO_MOVE carried its own single-use token"
+            # invariant is *inspectable* in a test, not merely true by
+            # construction. ``require_motion_token`` above has already redeemed
+            # it, so what is kept here is a spent token: it proves this packet was
+            # separately authorised and can never be replayed. Keeping the object
+            # (rather than its id) is deliberate -- ids of short-lived objects get
+            # recycled, which would make a uniqueness assertion meaningless.
+            "token": token,
         }
         for servo_id, target in targets:
             joint = self.joints.get(servo_id)
