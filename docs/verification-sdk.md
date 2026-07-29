@@ -651,10 +651,20 @@ Audit of all 1 675 probe commands issued across those runs:
 
 ### Residual concerns, stated plainly
 
-1. **Stall budget headroom is thin.** Trial 0 used 13 200 ms of a 14 400 ms cap — 92%. A real
-   arm whose stops sit close to the rail will do more stepping than the sim's, and the run may
-   abort. Aborting is safe (nothing is written) but it means a legitimate calibration can fail
-   and need rerunning per joint.
+1. ~~**Stall budget headroom is thin.**~~ **FIXED** — and the real problem was worse than thin
+   headroom. The 14 400 ms cap was a *constant* whose arithmetic held only at the shipped
+   defaults. `--confirmations 3` raises the true worst case to 19 200 ms, so a legitimate
+   full-arm run would have aborted every time; `--step 10` roughly triples the probe packets
+   and blew the fixed torque cap the same way. Aborting is safe (nothing is written), but a
+   correct calibration could not complete and the operator had no way to tell a genuine safety
+   trip from an arithmetic bug. All three budgets are now derived in `__post_init__` from
+   `step`, `step_duration_ms`, `confirmations` and `verification_moves`; at the defaults the
+   derivation reproduces the hand-checked numbers exactly (stall 14 400 ms), so this is a
+   generalisation rather than a loosening. Explicit overrides are still honoured and validated.
+   19 regression tests in `tests/test_budget_derivation.py` pin the scaling relationship.
+   The 92% headroom observation stands as an *observation* — the cap is a proven hard bound
+   (the number of stalling packets is set by `confirmations`, not by search distance), so
+   running close to it is by design, not luck.
 2. **400 ms × ~33 bursts per joint is bounded, not zero.** This is categorically different from
    the original incident (one sustained command, torque left on indefinitely), but LDX-218
    publishes no anti-stall protection, so cumulative heating over a full-arm run is a real if
