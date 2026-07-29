@@ -599,3 +599,67 @@ Fixed with `protocol.normalize_targets()`, called by both transports before the 
 assert. Accepts a `Mapping` or a sequence of 2-tuples; everything else (bare ints, strings,
 generators, wrong arity, non-iterables) raises `IllegalServoTarget`. Regression coverage in
 `tests/test_target_normalization.py` (13 tests).
+
+## 2026-07-28 — vision-guided auto-calibration, independent verification (orchestrator)
+
+The first delivery of this feature **passed all its own tests and discovered nothing.** It
+searched inside `effective_bounds()` — the provisional uncalibrated band [1200, 1800] — which
+is the very band it exists to replace. It returned `provisional ± margin` and labelled the
+result `bounded_by_electrical_limit`, which would have told an operator the hardware physically
+could not travel further. Its tests passed because they simulated mechanical stops *inside* the
+provisional band, a configuration that cannot occur on real hardware (the provisional band is
+conservative precisely because the true stops are wider). Sent back for rework.
+
+After rework the search runs out to `absolute_bounds()` via a narrow, audited
+`probe_absolute_bounds` path. Verified against the simulator's ground truth:
+
+| joint | discovered | TRUE mechanical | absolute rail | finding |
+|---|---|---|---|---|
+| GRIP | [1560, 2240] | (1500, 2500) | (1500, 2300) | policy_limit / policy_limit |
+| WRIST_ROLL | [960, 2040] | (900, 2100) | (700, 2300) | mechanical_stop |
+| WRIST_FLEX | [960, 2040] | (900, 2100) | (700, 2300) | mechanical_stop |
+| ELBOW | [900, 2100] | (850, 2150) | (700, 2300) | mechanical_stop |
+| SHOULDER_LIFT | [900, 2100] | (850, 2150) | (700, 2300) | mechanical_stop |
+| SHOULDER_PAN | [840, 2160] | (800, 2200) | (700, 2300) | mechanical_stop |
+
+No discovered band is wider than physical truth. GRIP's ends are honestly labelled
+`policy_limit`: the 2300 ceiling is our own, below the true 2500 stop, so that end is
+undiscoverable by design.
+
+### Anti-overfit check
+
+Passing against today's `DEFAULT_MECHANICAL_LIMITS` proves nothing if the algorithm was tuned
+to them. Re-ran with **5 randomly generated arms** whose true mechanical stops the code has
+never seen (seed 20260728, stops drawn inside the absolute rail):
+
+| trial | max error at a detected stop | total stall |
+|---|---|---|
+| 0 | 60 units | 13 200 ms |
+| 1 | 60 units | 11 600 ms |
+| 2 | 60 units | 12 800 ms |
+| 3 | 60 units | 10 800 ms |
+| 4 | 60 units | 12 800 ms |
+
+Error is exactly the configured 60-unit back-off margin every time, always on the conservative
+side, never wider than truth. That is discovery, not curve-fitting.
+
+Audit of all 1 675 probe commands issued across those runs:
+- every burst was **400 ms**, none longer;
+- GRIP was never commanded below **1500** (min seen: exactly 1500);
+- nothing was commanded outside **700..2300**, the absolute rail (min 700, max 2280);
+- every probe logged `UNCALIBRATED OVERRIDE (ABSOLUTE-RAIL PROBE)` with a reason string.
+
+### Residual concerns, stated plainly
+
+1. **Stall budget headroom is thin.** Trial 0 used 13 200 ms of a 14 400 ms cap — 92%. A real
+   arm whose stops sit close to the rail will do more stepping than the sim's, and the run may
+   abort. Aborting is safe (nothing is written) but it means a legitimate calibration can fail
+   and need rerunning per joint.
+2. **400 ms × ~33 bursts per joint is bounded, not zero.** This is categorically different from
+   the original incident (one sustained command, torque left on indefinitely), but LDX-218
+   publishes no anti-stall protection, so cumulative heating over a full-arm run is a real if
+   modest risk. The operator must supervise with the power switch in reach.
+3. **Gripper closed-on-object vs. gripper-at-stop remains indistinguishable by vision.**
+   Documented in `docs/calibration.md`, not solved. Calibrate GRIP with empty jaws.
+4. **Never validated on the physical arm.** Everything above is the simulator. The sim's
+   end-stop model is an assumption about this hardware, not a measurement of it.
