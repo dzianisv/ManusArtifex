@@ -83,7 +83,7 @@ faking ground truth, which poisons everything downstream.
 |---|---|---|---|---|
 | Gemini Robotics-ER 1.6 | ✅ API | ✅ cloud | no | ✅ use as planner |
 | Gemini Robotics (VLA / on-device) | ❌ | – | yes | ❌ |
-| OpenVLA (7B) | ✅ | ❌ CUDA + flash-attn | yes | ❌ |
+| OpenVLA (7B) | ✅ | ❌ CUDA + flash-attn, no aarch64 wheels | **no** — image+prompt only | ❌ *see below* |
 | Octo | ✅ | ❌ GPU/TPU | yes | ❌ |
 | π0 / openpi | ✅ weights | ❌ **NVIDIA + Ubuntu only**, 8–70 GB VRAM | yes | ❌ |
 | SmolVLA (450M) | ✅ | ✅ **CPU/Mac ok** | yes | ❌ *compute fine, feedback fatal* |
@@ -184,3 +184,86 @@ Beyond the existing three layers (`docs/safety.md`):
   Only a non-LLM ROS2 driver exists: <https://github.com/andrewda/learm_ros2>.
 - `cv2.calibrateHandEye` needs *achieved* poses we cannot read — textbook hand-eye calibration
   is unavailable to us. Visual servoing replaces it.
+
+## Appendix — Jetson? (2026-07-28)
+
+**No. Not until the servos are replaced.** A Jetson fixes compute. Our blocker is a sensor.
+
+### Correction to the table above
+
+**OpenVLA is not state-conditioned.** Its documented inference call takes image + prompt only —
+it is the one surveyed action-output VLA that does not structurally require proprioception. An
+earlier version of this doc said otherwise; that was wrong.
+
+It still doesn't work for us, one layer down: it emits **7-DoF end-effector deltas**, and you
+cannot convert a delta into a joint command without knowing your current pose — which is exactly
+what we can't measure. Plus 7B Llama-2 (~15 GB of weights) pinned to `flash-attn 2.5.5` /
+`torch 2.2.0` with no aarch64 wheels. Right conclusion, wrong reason, now fixed.
+
+### Memory floor vs. what "a small Jetson" means
+
+GR00T N1.7 README, Hardware Requirements: *"Inference: 1 GPU with 16 GB+ VRAM."*
+
+| Module | Memory | GR00T (16 GB floor) |
+|---|---|---|
+| Jetson Nano (original, 4 GB) | 4 GB | dead — stuck on the JetPack 4.6.x line |
+| **Orin Nano 8 GB / "Super" ($249)** | 8 GB | **blocked** — this is what "a small Jetson" usually means |
+| Orin NX 8 GB | 8 GB | blocked |
+| Orin NX 16 GB | 16 GB | exactly at the floor; in *no* NVIDIA benchmark or install script |
+| AGX Orin 64 GB | 64 GB | works at **2.9–4.6 Hz** |
+| AGX Thor (128 GB) | 128 GB | 10.7 Hz w/ TensorRT |
+
+NVIDIA's own benchmark table labels the AGX Orin row *"Legacy Jetson edge… only suitable for
+slow, non-reactive tasks."* That is their words about their $2k-class module.
+
+GR00T does ship real Jetson support (`scripts/deployment/orin/`, `thor/`, Docker profiles
+`gr00t-orin` / `gr00t-thor`, tested on JetPack 6.2 / 7.1) via the Jetson AI Lab wheel index —
+but `torchcodec` builds from source on aarch64, and `uv run python` there will silently destroy
+the platform environment by re-syncing against the x86_64 `pyproject.toml`.
+
+### The state requirement, restated at the source
+
+- GR00T's observation dict is `{video, state, language}`; `state` is mandatory and validated at
+  runtime under `strict=True`. N1.7's relative-EEF action space is *defined* as deltas from
+  current pose.
+- SmolVLA takes "the robot's current sensorimotor state" as one of three required inputs.
+- LeRobot's `SOFollower.get_observation()` is one line: `sync_read("Present_Position")`. There is
+  **no stateless robot class anywhere** in the `robots/` tree.
+
+### What to buy instead
+
+**~$122, and none of it a Jetson.** SO-101 *follower-only* (LeRobot-native, Feetech STS3215
+serial bus servos with position readback):
+
+| Item | Cost |
+|---|---|
+| 6× STS3215 @ $13.89 | $83.34 |
+| Waveshare bus servo driver board | $10.60 |
+| cable / PSU / clamps / drivers | $28.00 |
+| **total** | **$121.94** + 3D-printed parts (budget $30–60 if outsourced) |
+
+Compute stays as-is: SmolVLA is 450 M params and HuggingFace states it runs "even a MacBook".
+Fine-tune on a rented A100 (~4 h / 20k steps). GR00T, openpi and SmolVLA all ship remote
+policy-server transports (ZMQ/websocket) *precisely so the GPU need not be on the robot* — so
+even in the good case the Jetson is optional.
+
+### Order of operations
+
+1. Buy the SO-101 follower kit. It is the cheapest line item here and the only one that removes
+   the actual blocker.
+2. Keep the LeArm on the Gemini-ER + scripted-controller path. It matches what an open-loop arm
+   can actually do, and "pick up an object" needs no 30 Hz loop. Safety layer and sim carry over.
+3. On arrival: calibrate, teleoperate **~50 episodes** (5 object positions × 10 — HF explicitly
+   reports 25 episodes *failing*), push the dataset.
+4. Fine-tune `lerobot/smolvla_base`; run rollouts from the MacBook.
+5. Only if you can *name* a measured latency problem, price a Jetson — against a cloud policy
+   server, which is what NVIDIA's own PolicyServer/PolicyClient architecture exists for.
+
+### Unverified
+
+- LX-224HV as a drop-in for LDX-218 in a LeArm chassis: no dimensional drawings found, and it's
+  an 11.1 V HV servo against the LeArm's 6–7.4 V rail. **Treat the retrofit as unproven** — the
+  SO-101 route avoids the question entirely.
+- Orin NX 16 GB actually loading GR00T alongside an OS: UNKNOWN, untested by NVIDIA.
+- Jetson Nano's exact terminal JetPack version (EOL direction confirmed; "4.6.7" not confirmed).
+- 3D-printing cost, and current Koch v1.1 / Moss / Trossen prices.
