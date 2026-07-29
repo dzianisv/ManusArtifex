@@ -119,6 +119,24 @@ class SafetyLayer:
     def _mint_token(self) -> MotionToken:
         return MotionToken(id(self._transport))
 
+    @staticmethod
+    def _request_bounds(
+        key: str,
+        allow_uncalibrated_override: bool,
+        probe_absolute_bounds: bool,
+    ) -> tuple:
+        """The policy ring a request is checked against, before the hard backstop.
+
+        Normally ``config.effective_bounds``. With ``probe_absolute_bounds`` it is
+        ``config.absolute_bounds`` itself -- which is the *outermost* ring this
+        package recognises, so this can widen the check but can never take it past
+        the unconditional ``absolute_bounds`` backstop applied afterwards (the two
+        become identical, which is the point).
+        """
+        if probe_absolute_bounds:
+            return config.absolute_bounds(key)
+        return config.effective_bounds(key, allow_uncalibrated_override=allow_uncalibrated_override)
+
     def move(
         self,
         positions: Mapping[str, int],
@@ -128,6 +146,7 @@ class SafetyLayer:
         hold: Optional[Iterable[str]] = None,
         allow_uncalibrated_override: bool = False,
         override_reason: Optional[str] = None,
+        probe_absolute_bounds: bool = False,
         vision_guard=None,
         wait: bool = True,
     ) -> Dict[str, int]:
@@ -145,11 +164,43 @@ class SafetyLayer:
         and widens the allowed band to the joint's configured min/max (still
         intersected with that joint's absolute guard, ``config.absolute_bounds``,
         which can never be widened).
+
+        ``probe_absolute_bounds`` is a *narrower and stronger* capability than
+        ``allow_uncalibrated_override``, and exists for exactly one caller:
+        ``calibrate.py``'s supervised, vision-confirmed, torque-burst-limited
+        search for a joint's real mechanical stops. It replaces the per-joint
+        ``config.effective_bounds`` ceiling with ``config.absolute_bounds`` -- the
+        hardcoded ``GLOBAL_GUARD_MIN/MAX`` ring intersected with that servo's own
+        ``ELECTRICAL_LIMITS``, which nothing in this package may widen.
+
+        Why it is a separate flag rather than a change to
+        ``allow_uncalibrated_override``: the override is anchored to
+        ``config.JOINT_LIMITS[name].min/max`` (the band configured in
+        ``config.json``), and for every uncalibrated joint in the shipped config
+        that band is *numerically identical* to the provisional band, so the
+        override buys nothing at all -- but it is the documented, tested
+        behaviour of ``robohand move --override-reason``, and widening it for
+        every caller is a far bigger blast radius than one calibration routine
+        needs. This flag is deliberately not reachable from any CLI subcommand.
+
+        ``probe_absolute_bounds`` still requires ``allow_uncalibrated_override``
+        and a non-empty ``override_reason`` (so it reuses the same audit log and
+        WARNING), and it does **not** touch the unconditional
+        ``config.absolute_bounds`` backstop below -- that check is still applied
+        to every target, on every path, exactly as strictly as before. It widens
+        *which policy ring* is consulted; it can never fabricate permission to
+        leave the hardcoded rail.
         """
         if self._closed:
             raise SafetyViolation("SafetyLayer is closed; all servos have been unloaded")
         if allow_uncalibrated_override and not override_reason:
             raise ValueError("allow_uncalibrated_override requires a non-empty override_reason")
+        if probe_absolute_bounds and not allow_uncalibrated_override:
+            raise ValueError(
+                "probe_absolute_bounds requires allow_uncalibrated_override=True and a "
+                "non-empty override_reason -- probing out to the absolute rail is a "
+                "supervised, audited act, not a quiet default."
+            )
 
         if duration_ms is None:
             duration_ms = config.DEFAULT_DURATION_MS
@@ -170,7 +221,7 @@ class SafetyLayer:
                     f"({type(requested).__name__}). Refusing to move."
                 )
             requested = int(requested)
-            lo, hi = config.effective_bounds(key, allow_uncalibrated_override=allow_uncalibrated_override)
+            lo, hi = self._request_bounds(key, allow_uncalibrated_override, probe_absolute_bounds)
             limit = config.JOINT_LIMITS[key]
             if not (lo <= requested <= hi):
                 if not limit.calibrated and not allow_uncalibrated_override:
@@ -191,14 +242,18 @@ class SafetyLayer:
                 raise PositionOutOfRange(
                     f"{key}: requested position {requested} is outside its allowed "
                     f"range [{lo}, {hi}]"
-                    f"{' even with the override applied' if allow_uncalibrated_override else ''}. "
+                    f"{' even with probe_absolute_bounds applied (this IS the absolute rail)' if probe_absolute_bounds else (' even with the override applied' if allow_uncalibrated_override else '')}. "
                     f"Refusing to move -- choose a value inside [{lo}, {hi}], or "
                     f"recalibrate {key} in config.json if you believe this range is wrong."
                 )
             abs_lo, abs_hi = config.absolute_bounds(key)
             if not (abs_lo <= requested <= abs_hi):
-                # Unreachable given effective_bounds always intersects absolute_bounds --
-                # kept as a loud backstop against future regressions. Deliberately
+                # Unconditional backstop. It is deliberately NOT gated on any flag --
+                # not on allow_uncalibrated_override, not on probe_absolute_bounds --
+                # so that a bug in any caller's own bounds logic (including
+                # calibrate.py's) still cannot get a target past this line. Normally
+                # unreachable, because every band above is already intersected with
+                # (or equal to) absolute_bounds. Deliberately
                 # per-servo (not the flat GLOBAL_GUARD_MIN/MAX pair): GRIP's own floor
                 # is 1500, stricter than the generic 700 that is fine for every other
                 # joint (see docs/research-hardware.md).
@@ -214,10 +269,12 @@ class SafetyLayer:
                 "joints": sorted(targets),
                 "reason": override_reason,
                 "targets": dict(targets),
+                "probe_absolute_bounds": bool(probe_absolute_bounds),
             }
             self.override_log.append(entry)
             logger.warning(
-                "UNCALIBRATED OVERRIDE used for %s -> %s | reason: %s",
+                "UNCALIBRATED OVERRIDE%s used for %s -> %s | reason: %s",
+                " (ABSOLUTE-RAIL PROBE)" if probe_absolute_bounds else "",
                 sorted(targets), targets, override_reason,
             )
 
@@ -241,7 +298,7 @@ class SafetyLayer:
                     # in-range points is mathematically guaranteed to stay in range,
                     # so this should never actually change anything. If it ever does,
                     # log loudly rather than silently swallowing it.
-                    lo, hi = config.effective_bounds(name, allow_uncalibrated_override=allow_uncalibrated_override)
+                    lo, hi = self._request_bounds(name, allow_uncalibrated_override, probe_absolute_bounds)
                     abs_lo, abs_hi = config.absolute_bounds(name)
                     pos = max(abs_lo, min(abs_hi, max(lo, min(hi, raw_pos))))
                     if pos != raw_pos:

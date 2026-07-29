@@ -90,6 +90,206 @@ def assert_no_grip_command_below_floor(transport: SimTransport):
 
 
 # ---------------------------------------------------------------------------
+# 0: the SafetyLayer capability the search is built on
+#
+# ``probe_absolute_bounds`` is the only thing that lets this routine look past the
+# configured band. These tests pin its exact contract: what it widens, what it
+# does NOT widen, and that it cannot be reached by accident.
+# ---------------------------------------------------------------------------
+
+
+def test_probe_absolute_bounds_reaches_where_an_override_alone_cannot(fast):
+    """The bug this flag exists to fix, stated as a test.
+
+    ELBOW is uncalibrated with a configured band of 1200..1800, which is
+    *numerically identical* to its provisional band -- so
+    ``allow_uncalibrated_override=True`` widens nothing at all and 800 is refused.
+    Its absolute rail is 700..2300, and 800 is comfortably inside it. Only
+    ``probe_absolute_bounds`` can get there.
+    """
+    from robohand import safety as safety_mod
+
+    assert config.effective_bounds("ELBOW", allow_uncalibrated_override=True) == (1200, 1800)
+    assert config.absolute_bounds("ELBOW") == (700, 2300)
+
+    with make_arm() as arm:
+        # A legal, ordinary override first, so the audit log has a comparison row.
+        arm._safety.move(
+            {"ELBOW": 1750},
+            allow_uncalibrated_override=True,
+            override_reason="ordinary override",
+            wait=False,
+        )
+        assert arm._safety.override_log[-1]["probe_absolute_bounds"] is False
+
+        with pytest.raises(safety_mod.PositionOutOfRange):
+            arm._safety.move(
+                {"ELBOW": 800},
+                allow_uncalibrated_override=True,
+                override_reason="override alone must not reach here",
+                wait=False,
+            )
+        assert [(sid, pos) for e in arm._transport.log if e["cmd"] == "MOVE"
+                for sid, pos in e["targets"]] == [(4, 1750)]
+
+        result = arm._safety.move(
+            {"ELBOW": 800},
+            allow_uncalibrated_override=True,
+            override_reason="auto-calibration probe (test)",
+            probe_absolute_bounds=True,
+            wait=False,
+        )
+        assert result == {"ELBOW": 800}
+        assert (4, 800) in [(sid, pos) for e in arm._transport.log if e["cmd"] == "MOVE"
+                            for sid, pos in e["targets"]]
+
+        # The audit trail records that the stronger capability was used, through
+        # the *existing* override_log -- not a second, parallel logging path.
+        assert arm._safety.override_log[-1]["probe_absolute_bounds"] is True
+
+
+def test_probe_absolute_bounds_still_refuses_a_target_outside_the_absolute_rail():
+    """The flag widens which *policy* ring applies. It does not touch the hard rail."""
+    from robohand import safety as safety_mod
+
+    with make_arm() as arm:
+        for target in (699, 2301, 500, 2500):
+            with pytest.raises(safety_mod.SafetyViolation):
+                arm._safety.move(
+                    {"ELBOW": target},
+                    allow_uncalibrated_override=True,
+                    override_reason="auto-calibration probe (test)",
+                    probe_absolute_bounds=True,
+                    wait=False,
+                )
+        assert [e for e in arm._transport.log if e["cmd"] == "MOVE"] == []
+
+
+def test_the_absolute_rail_backstop_is_not_gated_on_the_new_flag(monkeypatch):
+    """Prove the *final* backstop, not just the range check in front of it.
+
+    With ``probe_absolute_bounds`` the policy ring and the rail coincide, so
+    ``PositionOutOfRange`` fires first and ``OutOfGlobalGuard`` is normally
+    unreachable -- which is exactly why it needs testing another way. Sabotage the
+    policy-ring computation (simulating a future bug in bounds logic, in
+    ``calibrate.py`` or anywhere else) and confirm the unconditional
+    ``config.absolute_bounds`` check still refuses, *with the new flag set*.
+    """
+    from robohand import safety as safety_mod
+
+    monkeypatch.setattr(
+        safety_mod.SafetyLayer, "_request_bounds",
+        staticmethod(lambda key, override, probe: (0, 4000)),
+    )
+    with make_arm() as arm:
+        for joint, target in (("ELBOW", 400), ("ELBOW", 2400), ("GRIP", 1499), ("GRIP", 700)):
+            with pytest.raises(safety_mod.OutOfGlobalGuard):
+                arm._safety.move(
+                    {joint: target},
+                    allow_uncalibrated_override=True,
+                    override_reason="sabotaged bounds logic",
+                    probe_absolute_bounds=True,
+                    wait=False,
+                )
+        assert [e for e in arm._transport.log if e["cmd"] == "MOVE"] == []
+        assert_no_grip_command_below_floor(arm._transport)
+
+
+def test_probe_absolute_bounds_can_never_command_grip_below_its_floor():
+    """GRIP's rail floor is its own electrical floor (1500), not the flat 700.
+
+    This is the 2026-07-28 incident value restated against the new capability: even
+    the widest thing this package can now ask for stops at 1500, and anything below
+    it is refused before a packet is built.
+    """
+    from robohand import safety as safety_mod
+
+    assert config.absolute_bounds("GRIP") == (1500, 2300)
+    with make_arm() as arm:
+        for target in (1499, 1000, 700):
+            with pytest.raises(safety_mod.SafetyViolation):
+                arm._safety.move(
+                    {"GRIP": target},
+                    allow_uncalibrated_override=True,
+                    override_reason="auto-calibration probe (test)",
+                    probe_absolute_bounds=True,
+                    wait=False,
+                )
+        # 1500 exactly -- the floor itself -- is reachable, and nothing below it is.
+        arm._safety.move(
+            {"GRIP": 1500},
+            allow_uncalibrated_override=True,
+            override_reason="auto-calibration probe (test)",
+            probe_absolute_bounds=True,
+            wait=False,
+        )
+        assert_no_grip_command_below_floor(arm._transport)
+
+
+def test_probe_absolute_bounds_requires_an_audited_override():
+    """It cannot be used quietly: no override flag, or no reason, is a hard error."""
+    with make_arm() as arm:
+        with pytest.raises(ValueError, match="probe_absolute_bounds requires"):
+            arm._safety.move({"ELBOW": 800}, probe_absolute_bounds=True, wait=False)
+        with pytest.raises(ValueError, match="override_reason"):
+            arm._safety.move(
+                {"ELBOW": 800},
+                allow_uncalibrated_override=True,
+                override_reason="",
+                probe_absolute_bounds=True,
+                wait=False,
+            )
+        assert [e for e in arm._transport.log if e["cmd"] == "MOVE"] == []
+
+
+def test_probe_absolute_bounds_defaults_off_everywhere_and_is_not_on_the_cli():
+    """Structural: no existing caller can turn it on, and no CLI flag maps to it.
+
+    ``robohand move --override-reason`` keeps exactly its old semantics; the only
+    module allowed to set this flag is ``calibrate.py``.
+    """
+    import inspect
+
+    from robohand import cli
+    from robohand import safety as safety_mod
+
+    for func in (safety_mod.SafetyLayer.move, Arm.set_positions):
+        param = inspect.signature(func).parameters["probe_absolute_bounds"]
+        assert param.default is False
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+    cli_source = inspect.getsource(cli)
+    assert "probe_absolute_bounds" not in cli_source, (
+        "the absolute-rail probe must not be reachable from any CLI subcommand"
+    )
+    move_source = inspect.getsource(cli.cmd_move)
+    assert "probe" not in move_source
+
+
+def test_uncalibrated_override_semantics_are_unchanged_without_the_flag():
+    """Regression fence around the existing ``robohand move --override-reason`` path."""
+    from robohand import safety as safety_mod
+
+    with make_arm() as arm:
+        # Still bounded by the configured band, exactly as before this feature.
+        for joint, inside, outside in (("ELBOW", 1800, 1801), ("GRIP", 1600, 1599)):
+            arm._safety.move(
+                {joint: inside},
+                allow_uncalibrated_override=True,
+                override_reason="unchanged behaviour check",
+                wait=False,
+            )
+            with pytest.raises(safety_mod.PositionOutOfRange):
+                arm._safety.move(
+                    {joint: outside},
+                    allow_uncalibrated_override=True,
+                    override_reason="unchanged behaviour check",
+                    wait=False,
+                )
+
+
+
+# ---------------------------------------------------------------------------
 # 1 + 2: discovery is always inside the true limits, and close to them
 # ---------------------------------------------------------------------------
 

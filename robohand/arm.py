@@ -261,6 +261,7 @@ class Arm:
         hold: Optional[Iterable[str]] = None,
         allow_uncalibrated_override: bool = False,
         override_reason: Optional[str] = None,
+        probe_absolute_bounds: bool = False,
         vision_guard: object = _AUTO_VISION_GUARD,
     ) -> Dict[str, int]:
         """Move one or more named joints. The ONLY thing this method does with the
@@ -270,6 +271,12 @@ class Arm:
         moving if a joint is uncalibrated and the request is outside its provisional
         band (pass ``allow_uncalibrated_override=True`` + ``override_reason`` to
         widen this, which is logged as a WARNING).
+
+        ``probe_absolute_bounds`` is a separate, stronger capability forwarded
+        verbatim to ``SafetyLayer.move`` -- see its docstring. It is only ever set
+        by ``calibrate.py``'s supervised limit search; no CLI subcommand exposes
+        it, and it still requires the override flag + reason and is still subject
+        to ``SafetyLayer``'s unconditional ``config.absolute_bounds`` backstop.
 
         By default this uses whatever ``self.vision_guard`` currently is (an
         automatic, hard-fail check: any move with no observed motion raises
@@ -289,6 +296,7 @@ class Arm:
             hold=hold,
             allow_uncalibrated_override=allow_uncalibrated_override,
             override_reason=override_reason,
+            probe_absolute_bounds=probe_absolute_bounds,
             vision_guard=guard,
             wait=wait,
         )
