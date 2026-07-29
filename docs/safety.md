@@ -146,6 +146,13 @@ including the permanent GRIP asymmetry: GRIP's floor of 1500 is discoverable and
 coincides with a real stop, while its true open stop at ~2500 is **permanently
 undiscoverable**, because ring 1's ceiling of 2300 is stricter than the hardware.
 
+**See also** [pick.md](pick.md), which applies the same "command a small
+increment, look, decide" idea to *position* rather than travel. It refuses to
+run on an uncalibrated joint for the same reason this section exists, and it is
+blunt about the two things it cannot do: measure height (one camera on a plane
+gives X and Y, never Z) and hold an object for longer than the watchdog's
+`max_continuous_torque_ms` allows.
+
 ---
 
 ## The redesign: three independent layers of defence

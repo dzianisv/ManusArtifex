@@ -29,6 +29,17 @@ Controller Installed
 
 ## Documentation
 
+Start with [docs/safety.md](docs/safety.md) — it explains the gripper incident
+and the three defence rings everything else is built on.
+
+- [docs/safety.md](docs/safety.md) — safety architecture, limits, and procedures
+- [docs/calibration.md](docs/calibration.md) — vision-assisted joint calibration
+- [docs/pick.md](docs/pick.md) — vision-guided pick, and why it servos instead of solving IK
+- [docs/cocktail-robot.md](docs/cocktail-robot.md) — why no VLA can drive this arm
+- [docs/research-hardware.md](docs/research-hardware.md) — what the controller can and cannot report
+
+Vendor documentation:
+
 [Installation Manual](./doc/InstallationManual.pdf)
 [User Manual](./doc/UserManual.pdf)
 
