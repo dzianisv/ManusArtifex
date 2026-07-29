@@ -1,0 +1,698 @@
+"""Proof that vision-guided auto-calibration discovers real limits, stays inside
+them, spends a bounded amount of torque doing it, and fails closed everywhere else.
+
+Everything here runs against ``sim.SimTransport`` (``tests/conftest.py`` forces
+``ROBOHAND_TRANSPORT=sim`` for every test). No camera, no HID device, no cv2 window.
+
+The "camera" is ``observer.SimMotionObserver``, which renders each simulated
+joint's *achieved* position as a bar and runs those frames through a real
+``guard.VisionGuard``. It reads ground truth, never the commanded target, so a
+command that the simulated mechanical stop blocked genuinely renders as an
+unchanged frame -- the same thing a camera would see.
+
+Speed note: ``SafetyLayer.move`` floors every duration at ``config.MIN_DURATION_MS``
+(400 ms shipped) and sleeps for it. Most tests here monkeypatch that floor down and
+pass a matching ``step_duration_ms`` so a full two-direction sweep takes under a
+second. ``test_stall_time_stays_within_budget`` deliberately does NOT: it runs at
+the shipped 400 ms burst so its stall-time assertion is about the real default.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+
+import pytest
+
+from robohand import calibrate as calibration
+from robohand import config
+from robohand.arm import Arm
+from robohand.observer import (
+    FlakyMotionObserver,
+    MotionObserver,
+    NullMotionObserver,
+    ObserverError,
+    SimMotionObserver,
+)
+from robohand.sim import SimTransport
+
+GRIP_SERVO_ID = 1
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def make_arm(mechanical_limits=None) -> Arm:
+    """An ``Arm`` on a ``SimTransport`` with the requested mechanical end stops.
+
+    The transport is swapped after construction (and handed to the already-running
+    ``SafetyLayer``) so each test can model a *different* physical arm -- that is
+    what makes these tests prove discovery rather than a coincidental match with
+    ``sim.DEFAULT_MECHANICAL_LIMITS``.
+    """
+    arm = Arm(sim=True, use_vision=False, install_signal_handlers=False)
+    if mechanical_limits:
+        transport = SimTransport(mechanical_limits=mechanical_limits)
+        arm._transport = transport
+        arm._safety._transport = transport
+    return arm
+
+
+@pytest.fixture
+def fast(monkeypatch):
+    """Shrink the safety layer's duration floor so a sweep runs in well under a
+    second. Only the *timing* changes -- every check, ramp, token, and unload the
+    real routine performs still happens exactly as it would at 400 ms.
+    """
+    monkeypatch.setattr(config, "MIN_DURATION_MS", 20)
+    monkeypatch.setattr(config, "SETTLE_MARGIN_MS", 0)
+    return calibration.CalibrationSettings(step_duration_ms=20)
+
+
+def grip_targets(transport: SimTransport):
+    return [pos for entry in transport.log if entry["cmd"] == "MOVE"
+            for servo_id, pos in entry["targets"] if servo_id == GRIP_SERVO_ID]
+
+
+def assert_no_grip_command_below_floor(transport: SimTransport):
+    """The 2026-07-28 incident, restated as an assertion.
+
+    GRIP's absolute floor is 1500 (its own electrical limit, stricter than the flat
+    700 global guard). The incident commanded 700. Nothing this routine emits may
+    ever go below 1500 -- and in practice it stays at 1600, the configured floor.
+    """
+    floor = config.absolute_bounds("GRIP")[0]
+    assert floor == 1500
+    below = [p for p in grip_targets(transport) if p < floor]
+    assert below == [], f"GRIP commanded below its absolute floor {floor}: {below}"
+
+
+# ---------------------------------------------------------------------------
+# 1 + 2: discovery is always inside the true limits, and close to them
+# ---------------------------------------------------------------------------
+
+
+# Each case models a *different physical arm*, with mechanical stops chosen to
+# differ from sim.DEFAULT_MECHANICAL_LIMITS, so passing requires actually finding
+# them rather than echoing a default.
+DISCOVERY_CASES = [
+    # (joint, servo_id, true mechanical limits)
+    ("GRIP", 1, (1723, 2131)),
+    ("ELBOW", 4, (1287, 1712)),
+    ("SHOULDER_PAN", 6, (1341, 1663)),
+    ("WRIST_FLEX", 3, (1252, 1749)),
+]
+
+
+@pytest.mark.parametrize("joint,servo_id,true_limits", DISCOVERY_CASES)
+def test_discovered_band_is_inside_true_mechanical_limits(joint, servo_id, true_limits, fast):
+    true_min, true_max = true_limits
+    with make_arm({servo_id: true_limits}) as arm:
+        observer = SimMotionObserver(arm._transport)
+        run = calibration.calibrate(arm, [joint], settings=fast, observer=observer, write=False)
+        result = run.joints[joint]
+        assert_no_grip_command_below_floor(arm._transport)
+
+    # SAFE: never wider than the truth. A calibration that claims more range than
+    # the joint has is the dangerous failure mode -- it would authorise moves into
+    # the stop for the rest of the arm's life.
+    assert result.min >= true_min, f"{joint} min {result.min} is BELOW the true stop {true_min}"
+    assert result.max <= true_max, f"{joint} max {result.max} is ABOVE the true stop {true_max}"
+
+    # USEFUL: not uselessly narrow either. One probe step can be spent overshooting
+    # into the stop and the margin is then applied from the last confirmed-moving
+    # position, so the recorded limit lands within step + margin of the truth.
+    tolerance = fast.step + fast.margin
+    assert result.min - true_min <= tolerance, (
+        f"{joint} min {result.min} is more than {tolerance} away from true {true_min}"
+    )
+    assert true_max - result.max <= tolerance, (
+        f"{joint} max {result.max} is more than {tolerance} away from true {true_max}"
+    )
+
+    assert result.min_finding == calibration.FINDING_MECHANICAL_STOP
+    assert result.max_finding == calibration.FINDING_MECHANICAL_STOP
+
+
+def test_stop_outside_the_searchable_band_is_reported_as_electrical_not_mechanical(fast):
+    """A joint whose mechanical stops are wider than the band we are allowed to
+    probe must report ``bounded_by_electrical_limit`` -- "we ran out of legal room"
+    is a different claim from "we found the stop", and conflating them would let a
+    later reader believe a limit was measured when it never was.
+    """
+    with make_arm({4: (500, 2500)}) as arm:
+        run = calibration.calibrate(
+            arm, ["ELBOW"], settings=fast, observer=SimMotionObserver(arm._transport), write=False
+        )
+    result = run.joints["ELBOW"]
+    lo, hi = calibration.search_bounds("ELBOW")
+    assert result.min_finding == calibration.FINDING_ELECTRICAL_LIMIT
+    assert result.max_finding == calibration.FINDING_ELECTRICAL_LIMIT
+    assert result.min == lo + fast.margin
+    assert result.max == hi - fast.margin
+
+
+def test_grip_search_never_approaches_the_incident_value(fast):
+    """GRIP's downward search is floored at 1600 by config, 100 clear of the 1500
+    open stop and 900 clear of the 700 the incident commanded.
+    """
+    with make_arm({GRIP_SERVO_ID: (1520, 2480)}) as arm:
+        run = calibration.calibrate(
+            arm, ["GRIP"], settings=fast, observer=SimMotionObserver(arm._transport), write=False
+        )
+        targets = grip_targets(arm._transport)
+        assert_no_grip_command_below_floor(arm._transport)
+    assert min(targets) >= 1600
+    assert run.joints["GRIP"].min >= 1600
+    assert run.joints["GRIP"].min_finding == calibration.FINDING_ELECTRICAL_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# 3: bounded torque per run
+# ---------------------------------------------------------------------------
+
+
+def test_stall_time_stays_within_budget():
+    """Run at the SHIPPED 400 ms burst and assert a specific stall ceiling.
+
+    Derivation of the number, per direction:
+      * at most ONE step can be a partial travel that ends against the stop (the
+        simulated joint is pinned there by that single command), and
+      * exactly ``confirmations`` (2) further steps are commanded past the stop
+        before it is believed.
+    Every other move in the run -- the initial move to center, the observer
+    verification retreat, the back-off to the recorded limit -- targets a position
+    inside the mechanical range and therefore accrues no stall time at all.
+
+    So: 3 stalling commands x 2 directions x 400 ms = 2400 ms, and nothing else.
+    """
+    settings = calibration.CalibrationSettings()
+    assert settings.step_duration_ms == config.MIN_DURATION_MS == 400
+
+    with make_arm({GRIP_SERVO_ID: (1855, 2045)}) as arm:
+        calibration.calibrate(
+            arm, ["GRIP"], settings=settings, observer=SimMotionObserver(arm._transport), write=False
+        )
+        stall = arm._transport.stall_ms_total()
+        assert_no_grip_command_below_floor(arm._transport)
+        assert arm._transport.any_torque_on() is False
+
+    assert stall <= 2400, f"stall budget blown: {stall}ms > 2400ms"
+    # And, stated as the flat number the design promises rather than as arithmetic:
+    assert stall < 2500
+
+
+def test_every_step_unloads_before_the_next_move(fast):
+    """Torque-burst discipline, asserted from the transport log: no two MOVEs ever
+    occur without an UNLOAD between them. This is what makes a step into a stop cost
+    one bounded burst instead of the continuous torque of the incident.
+    """
+    with make_arm({4: (1287, 1712)}) as arm:
+        calibration.calibrate(
+            arm, ["ELBOW"], settings=fast, observer=SimMotionObserver(arm._transport), write=False
+        )
+        log = [e["cmd"] for e in arm._transport.log if e["cmd"] in ("MOVE", "UNLOAD")]
+
+    assert log.count("MOVE") > 5
+    shape = "".join("M" if cmd == "MOVE" else "U" for cmd in log)
+    assert "MM" not in shape, f"two MOVEs with no intervening UNLOAD: {shape}"
+    assert shape.endswith("U"), f"the run left torque commanded: {shape}"
+
+
+def test_torque_budget_abort_writes_nothing(tmp_path, fast, monkeypatch):
+    settings = calibration.CalibrationSettings(step_duration_ms=20, max_torque_ms=100)
+    with make_arm({4: (1287, 1712)}) as arm:
+        with pytest.raises(calibration.CalibrationAborted, match="torque"):
+            calibration.calibrate(
+                arm, ["ELBOW"], settings=settings,
+                observer=SimMotionObserver(arm._transport), output_dir=tmp_path,
+            )
+        assert arm._transport.any_torque_on() is False
+    assert list(tmp_path.glob("calibration-*.json")) == []
+
+
+def test_wall_clock_abort_writes_nothing(tmp_path, fast):
+    settings = calibration.CalibrationSettings(step_duration_ms=20, max_wall_clock_s=0.001)
+    with make_arm({4: (1287, 1712)}) as arm:
+        with pytest.raises(calibration.CalibrationAborted, match="wall-clock"):
+            calibration.calibrate(
+                arm, ["ELBOW"], settings=settings,
+                observer=SimMotionObserver(arm._transport), output_dir=tmp_path,
+            )
+    assert list(tmp_path.glob("calibration-*.json")) == []
+
+
+# ---------------------------------------------------------------------------
+# 4: a flaky observer must not yield a falsely-narrow result
+# ---------------------------------------------------------------------------
+
+
+def test_deterministic_flakiness_is_ridden_through(tmp_path, fast):
+    """Every seventh genuine motion report is dropped -- a camera that misses about
+    one real motion in seven.
+
+    Two things must hold for the run to survive that. First, with
+    ``confirmations=2`` a 1-in-7 pattern can never produce two consecutive misses,
+    so it cannot fabricate a stop. Second, the observer-reliability burst is 6
+    consecutive known-motion moves and tolerates 1 miss, and any 6 consecutive
+    observations contain at most one multiple of 7 -- so the burst passes. The
+    result must therefore still land inside the true limits and within one
+    step+margin of them, not narrower.
+    """
+    true_limits = (1287, 1712)
+    with make_arm({4: true_limits}) as arm:
+        observer = FlakyMotionObserver(SimMotionObserver(arm._transport), miss_every=7)
+        run = calibration.calibrate(
+            arm, ["ELBOW"], settings=fast, observer=observer, write=False
+        )
+    result = run.joints["ELBOW"]
+    assert observer.injected_misses > 0, "the fault injector never fired; test proves nothing"
+    assert true_limits[0] <= result.min < result.max <= true_limits[1]
+    tolerance = fast.step + fast.margin
+    assert result.min - true_limits[0] <= tolerance
+    assert true_limits[1] - result.max <= tolerance
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3, 4, 5, 6, 7])
+def test_aggressive_flakiness_never_produces_a_falsely_narrow_result(tmp_path, fast, seed):
+    """Half of all genuine motion reports are dropped at random.
+
+    The requirement is a disjunction, and both branches are acceptable: either the
+    consecutive-confirmation + observer-verification logic rides through and returns
+    a band that is still within tolerance of the truth, or the run aborts and writes
+    nothing. What must NOT happen is a completed run that silently records a band
+    far narrower than reality and marks it as a measurement.
+    """
+    true_limits = (1287, 1712)
+    tolerance = fast.step + fast.margin
+    with make_arm({4: true_limits}) as arm:
+        observer = FlakyMotionObserver(
+            SimMotionObserver(arm._transport), miss_probability=0.5, seed=seed
+        )
+        try:
+            run = calibration.calibrate(
+                arm, ["ELBOW"], settings=fast, observer=observer, output_dir=tmp_path
+            )
+        except calibration.CalibrationAborted:
+            assert list(tmp_path.glob("calibration-*.json")) == [], (
+                "an aborted run must never leave a result file behind"
+            )
+            return
+
+    result = run.joints["ELBOW"]
+    assert true_limits[0] <= result.min < result.max <= true_limits[1]
+    assert result.min - true_limits[0] <= tolerance, (
+        f"completed run recorded a falsely-narrow min: {result.min} vs true {true_limits[0]}"
+    )
+    assert true_limits[1] - result.max <= tolerance, (
+        f"completed run recorded a falsely-narrow max: {result.max} vs true {true_limits[1]}"
+    )
+
+
+def test_too_many_ambiguous_observations_aborts(tmp_path, fast):
+    settings = calibration.CalibrationSettings(step_duration_ms=20, max_ambiguous_observations=1)
+    with make_arm({4: (1287, 1712)}) as arm:
+        observer = FlakyMotionObserver(SimMotionObserver(arm._transport), miss_every=3)
+        with pytest.raises(calibration.CalibrationAborted, match="ambiguous"):
+            calibration.calibrate(
+                arm, ["ELBOW"], settings=settings, observer=observer, output_dir=tmp_path
+            )
+    assert list(tmp_path.glob("calibration-*.json")) == []
+
+
+# ---------------------------------------------------------------------------
+# 5: an observer that never sees motion aborts cleanly and writes nothing
+# ---------------------------------------------------------------------------
+
+
+def test_blind_observer_aborts_and_writes_no_file(tmp_path, fast):
+    """A lens cap, a dead camera, or a joint outside the ROI reads exactly like
+    "every joint is already at its mechanical stop". The routine must refuse to
+    record that as a measurement.
+    """
+    with make_arm({4: (1287, 1712)}) as arm:
+        observer = NullMotionObserver()
+        with pytest.raises(calibration.CalibrationAborted) as excinfo:
+            calibration.calibrate(
+                arm, ["ELBOW"], settings=fast, observer=observer, output_dir=tmp_path
+            )
+        assert arm._transport.any_torque_on() is False
+        assert arm._transport.stall_ms_total() == 0, (
+            "a blind-observer abort should stop long before anything reaches a stop"
+        )
+    assert "cannot reliably see this joint" in str(excinfo.value)
+    assert list(tmp_path.glob("calibration-*.json")) == []
+
+
+def test_blind_observer_aborts_for_every_joint(tmp_path, fast):
+    for joint in config.JOINT_NAMES:
+        with make_arm() as arm:
+            with pytest.raises(calibration.CalibrationAborted):
+                calibration.calibrate(
+                    arm, [joint], settings=fast,
+                    observer=NullMotionObserver(), output_dir=tmp_path,
+                )
+            assert_no_grip_command_below_floor(arm._transport)
+    assert list(tmp_path.glob("calibration-*.json")) == []
+
+
+class _ExplodingObserver(MotionObserver):
+    """Raises partway through -- a camera that is unplugged mid-run."""
+
+    def __init__(self, inner: MotionObserver, fail_after: int) -> None:
+        self._inner = inner
+        self._fail_after = fail_after
+        self.calls = 0
+
+    def available(self) -> bool:
+        return True
+
+    def capture(self):
+        return self._inner.capture()
+
+    def observe(self, before, after) -> bool:
+        self.calls += 1
+        if self.calls > self._fail_after:
+            raise ObserverError("camera disconnected")
+        return self._inner.observe(before, after)
+
+
+def test_observer_error_mid_run_aborts_and_writes_nothing(tmp_path, fast):
+    with make_arm({4: (1287, 1712)}) as arm:
+        observer = _ExplodingObserver(SimMotionObserver(arm._transport), fail_after=2)
+        with pytest.raises(calibration.CalibrationAborted, match="observer failed"):
+            calibration.calibrate(
+                arm, ["ELBOW"], settings=fast, observer=observer, output_dir=tmp_path
+            )
+        assert arm._transport.any_torque_on() is False
+    assert list(tmp_path.glob("calibration-*.json")) == []
+
+
+# ---------------------------------------------------------------------------
+# 6: the routine cannot bypass, widen, or out-argue the safety layer
+# ---------------------------------------------------------------------------
+
+
+def test_search_bounds_never_exceed_the_absolute_rail():
+    for name in config.JOINT_NAMES:
+        lo, hi = calibration.search_bounds(name)
+        abs_lo, abs_hi = config.absolute_bounds(name)
+        assert abs_lo <= lo <= hi <= abs_hi
+    assert calibration.search_bounds("GRIP")[0] >= 1500
+
+
+def test_every_commanded_target_stays_inside_the_absolute_rail(fast):
+    """Sweep every joint and assert, from the transport log, that not one packet
+    carried a target outside that servo's hardcoded rail.
+    """
+    limits = {1: (1723, 2131), 2: (1290, 1710), 3: (1252, 1749),
+              4: (1287, 1712), 5: (1301, 1699), 6: (1341, 1663)}
+    with make_arm(limits) as arm:
+        calibration.calibrate(
+            arm, config.JOINT_NAMES, settings=fast,
+            observer=SimMotionObserver(arm._transport), write=False,
+        )
+        moves = [(sid, pos) for e in arm._transport.log if e["cmd"] == "MOVE"
+                 for sid, pos in e["targets"]]
+        assert_no_grip_command_below_floor(arm._transport)
+
+    assert moves
+    for servo_id, pos in moves:
+        name = config.ID_TO_NAME[servo_id]
+        lo, hi = config.absolute_bounds(name)
+        assert lo <= pos <= hi, f"{name} commanded {pos}, outside absolute rail [{lo}, {hi}]"
+
+
+def test_a_step_refused_by_the_safety_layer_aborts_rather_than_being_swallowed(fast, monkeypatch):
+    """If this module ever computes a target the safety layer rejects, that is a bug
+    in its own bounds logic -- it must surface as an abort with nothing written, not
+    be retried, clamped, or ignored.
+    """
+    from robohand import safety
+
+    original = Arm.set_position
+    state = {"n": 0}
+
+    def sabotaged(self, name, position, *a, **kw):
+        state["n"] += 1
+        if state["n"] == 3:
+            # Simulate the bug: a target outside the joint's effective range.
+            position = config.absolute_bounds(name)[1] + 500
+            return original(self, name, position, *a, **kw)
+        return original(self, name, position, *a, **kw)
+
+    monkeypatch.setattr(Arm, "set_position", sabotaged)
+    with make_arm({4: (1287, 1712)}) as arm:
+        with pytest.raises(calibration.CalibrationAborted, match="refused by the safety layer"):
+            calibration.calibrate(
+                arm, ["ELBOW"], settings=fast,
+                observer=SimMotionObserver(arm._transport), write=False,
+            )
+        # The illegal packet never reached the transport.
+        moves = [pos for e in arm._transport.log if e["cmd"] == "MOVE"
+                 for sid, pos in e["targets"]]
+        assert all(pos <= config.absolute_bounds("ELBOW")[1] for pos in moves)
+    assert issubclass(safety.PositionOutOfRange, safety.SafetyViolation)
+
+
+def test_transport_still_refuses_a_move_without_a_token(fast):
+    """The choke point is unchanged by anything in this feature."""
+    from robohand.protocol import SafetyBypassError
+
+    with make_arm() as arm:
+        with pytest.raises(SafetyBypassError):
+            arm._transport.move_servos([(4, 1500)], 400)
+
+
+# -- out-of-policy settings fail closed -------------------------------------
+
+
+@pytest.mark.parametrize("kwargs,pattern", [
+    ({"step": 0}, "step must be in"),
+    ({"step": 500}, "step must be in"),
+    ({"step": 1.5}, "step must be an integer"),
+    ({"margin": -1}, "margin must be in"),
+    ({"confirmations": 1}, "confirmations must be in"),
+    ({"step_duration_ms": 900}, "torque-burst ceiling"),
+    ({"step_duration_ms": 10}, "below config.MIN_DURATION_MS"),
+    ({"max_wall_clock_s": 0}, "max_wall_clock_s"),
+])
+def test_out_of_policy_settings_are_refused(kwargs, pattern):
+    with pytest.raises(calibration.CalibrationRefused, match=re.escape(pattern)):
+        calibration.CalibrationSettings(**kwargs)
+
+
+def test_absurd_margin_is_refused_before_any_motion(tmp_path):
+    """A margin wide enough to swallow the joint's own searchable band must fail
+    closed -- refuse, do not quietly shrink the margin and carry on.
+    """
+    settings = calibration.CalibrationSettings(margin=400, step_duration_ms=config.MIN_DURATION_MS)
+    with make_arm() as arm:
+        with pytest.raises(calibration.CalibrationRefused, match="margin"):
+            calibration.calibrate(
+                arm, ["GRIP"], settings=settings,
+                observer=SimMotionObserver(arm._transport), output_dir=tmp_path,
+            )
+        assert [e for e in arm._transport.log if e["cmd"] == "MOVE"] == []
+    assert list(tmp_path.glob("calibration-*.json")) == []
+
+
+def test_coarse_step_is_refused_before_any_motion(tmp_path, fast, monkeypatch):
+    """A step too coarse to distinguish travel from a stop must fail closed.
+
+    The shipped provisional bands (600 wide) are large relative to ``MAX_STEP``, so
+    this guard cannot fire on the stock config -- squeeze the searchable band to a
+    sliver to prove it exists and refuses rather than silently proceeding on two
+    steps' worth of evidence.
+    """
+    monkeypatch.setattr(calibration, "search_bounds", lambda name: (1450, 1550))
+    settings = calibration.CalibrationSettings(step=60, step_duration_ms=20, margin=10)
+    with make_arm() as arm:
+        with pytest.raises(calibration.CalibrationRefused, match="too coarse"):
+            calibration.calibrate(
+                arm, ["ELBOW"], settings=settings,
+                observer=SimMotionObserver(arm._transport), output_dir=tmp_path,
+            )
+        assert [e for e in arm._transport.log if e["cmd"] == "MOVE"] == []
+    assert list(tmp_path.glob("calibration-*.json")) == []
+
+
+# ---------------------------------------------------------------------------
+# output file + promotion
+# ---------------------------------------------------------------------------
+
+
+def test_result_file_records_findings_and_provenance(tmp_path, fast):
+    with make_arm({GRIP_SERVO_ID: (1723, 2131)}) as arm:
+        run = calibration.calibrate(
+            arm, ["GRIP"], settings=fast,
+            observer=SimMotionObserver(arm._transport), output_dir=tmp_path,
+        )
+    assert run.output_path is not None and run.output_path.exists()
+    payload = json.loads(run.output_path.read_text())
+    assert payload["schema"] == calibration.SCHEMA
+    assert payload["transport"] == "sim"
+    entry = payload["joints"]["GRIP"]
+    for key in ("min", "max", "margin", "min_finding", "max_finding",
+                "steps_min", "steps_max", "ambiguous_observations", "torque_ms"):
+        assert key in entry, f"result file is missing {key}"
+    assert entry["min_finding"] in (
+        calibration.FINDING_MECHANICAL_STOP, calibration.FINDING_ELECTRICAL_LIMIT
+    )
+    # config.json must be untouched by a run.
+    assert config.JOINT_LIMITS["GRIP"].calibrated is False
+
+
+def test_promotion_updates_config_and_round_trips(tmp_path, fast, monkeypatch):
+    config_copy = tmp_path / "config.json"
+    config_copy.write_text(json.dumps(config.load_config(config.DEFAULT_CONFIG_PATH), indent=2))
+
+    with make_arm({GRIP_SERVO_ID: (1723, 2131)}) as arm:
+        run = calibration.calibrate(
+            arm, ["GRIP"], settings=fast,
+            observer=SimMotionObserver(arm._transport), output_dir=tmp_path,
+        )
+
+    applied = calibration.apply_calibration(
+        run.output_path, config_path=config_copy, allow_simulated=True
+    )
+    assert applied["GRIP"]["calibrated"] is True
+    reloaded = config.load_config(config_copy)
+    spec = reloaded["servos"]["GRIP"]
+    assert spec["calibrated"] is True
+    assert spec["min"] == run.joints["GRIP"].min
+    assert spec["max"] == run.joints["GRIP"].max
+    assert "PROVISIONAL" not in spec["comment"]
+    # And the written file still satisfies the exact validation config.py runs at
+    # import time, for every joint -- not just the promoted one.
+    for name, joint_spec in reloaded["servos"].items():
+        config._validate_servo_spec(name, joint_spec)
+
+
+def test_promotion_refuses_a_simulated_result_by_default(tmp_path, fast):
+    config_copy = tmp_path / "config.json"
+    config_copy.write_text(json.dumps(config.load_config(config.DEFAULT_CONFIG_PATH), indent=2))
+    with make_arm({GRIP_SERVO_ID: (1723, 2131)}) as arm:
+        run = calibration.calibrate(
+            arm, ["GRIP"], settings=fast,
+            observer=SimMotionObserver(arm._transport), output_dir=tmp_path,
+        )
+    with pytest.raises(calibration.CalibrationRefused, match="not real hardware"):
+        calibration.apply_calibration(run.output_path, config_path=config_copy)
+    assert json.loads(config_copy.read_text())["servos"]["GRIP"]["calibrated"] is False
+
+
+def test_promotion_refuses_a_hand_widened_calibration_file(tmp_path):
+    """The dangerous edit: someone hand-writes a calibration file claiming GRIP can
+    go to 900. Promotion must refuse it outright, not clamp it and proceed.
+    """
+    config_copy = tmp_path / "config.json"
+    original = config.load_config(config.DEFAULT_CONFIG_PATH)
+    config_copy.write_text(json.dumps(original, indent=2))
+    forged = tmp_path / "calibration-forged.json"
+    forged.write_text(json.dumps({
+        "schema": calibration.SCHEMA,
+        "transport": "hardware",
+        "joints": {"GRIP": {"min": 900, "max": 2400, "margin": 0,
+                            "min_finding": calibration.FINDING_MECHANICAL_STOP,
+                            "max_finding": calibration.FINDING_MECHANICAL_STOP}},
+    }))
+    with pytest.raises(calibration.CalibrationRefused, match="absolute rail"):
+        calibration.apply_calibration(forged, config_path=config_copy)
+    assert json.loads(config_copy.read_text()) == original
+
+
+def test_promotion_refuses_an_inverted_range(tmp_path):
+    config_copy = tmp_path / "config.json"
+    original = config.load_config(config.DEFAULT_CONFIG_PATH)
+    config_copy.write_text(json.dumps(original, indent=2))
+    forged = tmp_path / "calibration-inverted.json"
+    forged.write_text(json.dumps({
+        "schema": calibration.SCHEMA,
+        "transport": "hardware",
+        "joints": {"ELBOW": {"min": 1700, "max": 1300}},
+    }))
+    with pytest.raises(calibration.CalibrationRefused, match="empty or inverted"):
+        calibration.apply_calibration(forged, config_path=config_copy)
+    assert json.loads(config_copy.read_text()) == original
+
+
+def test_promotion_refuses_an_unknown_schema(tmp_path):
+    bad = tmp_path / "calibration-bad.json"
+    bad.write_text(json.dumps({"schema": "something-else", "joints": {}}))
+    with pytest.raises(calibration.CalibrationRefused, match="unknown calibration schema"):
+        calibration.apply_calibration(bad, config_path=tmp_path / "config.json")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def test_cli_calibrate_runs_under_sim(tmp_path, fast, capsys):
+    from robohand import cli
+
+    rc = cli.main([
+        "--sim", "calibrate", "--joint", "WRIST_ROLL",
+        "--step", "30", "--margin", "60", "--step-duration", "20",
+        "--out-dir", str(tmp_path), "--json",
+    ])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == calibration.SCHEMA
+    assert "WRIST_ROLL" in payload["joints"]
+    assert len(list(tmp_path.glob("calibration-*.json"))) == 1
+
+
+def test_cli_calibrate_refuses_real_hardware_without_the_presence_flag(monkeypatch, capsys):
+    """The refusal must happen before the transport is opened.
+
+    ``_make_arm`` and ``protocol.HidTransport`` are both replaced with a landmine:
+    if the guard ever failed, this test would fail loudly rather than reaching for
+    the real HID device (VID 0x0483 / PID 0x5750).
+    """
+    from robohand import cli, protocol
+
+    monkeypatch.delenv("ROBOHAND_TRANSPORT", raising=False)
+
+    def landmine(*args, **kwargs):
+        raise AssertionError("hardware path reached -- the presence gate did not hold")
+
+    monkeypatch.setattr(cli, "_make_arm", landmine)
+    monkeypatch.setattr(protocol, "HidTransport", landmine)
+
+    assert cli.main(["calibrate", "--joint", "GRIP"]) == 2
+    err = capsys.readouterr().err
+    assert "REFUSING TO RUN" in err
+    assert "--i-am-present-and-watching" in err
+
+    assert cli.main(["calibrate", "--all"]) == 2
+    assert "present" in capsys.readouterr().err
+
+
+def test_cli_calibrate_requires_a_target(capsys):
+    from robohand import cli
+
+    assert cli.main(["--sim", "calibrate"]) == 2
+    assert "--joint" in capsys.readouterr().err
+    assert cli.main(["--sim", "calibrate", "--joint", "GRIP", "--all"]) == 2
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+def test_cli_apply_refuses_a_widened_file(tmp_path, capsys, monkeypatch):
+    from robohand import cli
+
+    config_copy = tmp_path / "config.json"
+    config_copy.write_text(json.dumps(config.load_config(config.DEFAULT_CONFIG_PATH), indent=2))
+    monkeypatch.setenv("ROBOHAND_CONFIG", str(config_copy))
+    forged = tmp_path / "calibration-forged.json"
+    forged.write_text(json.dumps({
+        "schema": calibration.SCHEMA,
+        "transport": "hardware",
+        "joints": {"GRIP": {"min": 700, "max": 2300}},
+    }))
+    assert cli.main(["--sim", "calibrate", "--apply", str(forged)]) == 2
+    assert "absolute rail" in capsys.readouterr().err
+    assert json.loads(config_copy.read_text())["servos"]["GRIP"]["calibrated"] is False
