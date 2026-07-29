@@ -70,10 +70,14 @@ DEFAULT_BATTERY_VOLTAGE = 7.4
 # floor it will not droop below. This is a deliberately crude stand-in for the
 # pack's internal-resistance drop under load: its only job is to make "a joint
 # that actually moved drew current" observable through ``get_battery_voltage`` the
-# way it is on the real arm, so the liveness check can tell a disconnected servo
+# way it is on the real arm, so calibration can tell a disconnected servo
 # (no motion, flat pack) from a live-but-unseen one (moved, pack sagged). Sized so
-# a single liveness excursion (~150-300 units) drops the pack well past
+# one observer-reliability burst (>= ~150 units of oscillation) drops the pack past
 # calibrate.py's detection epsilon (0.05 V) without a whole run drooping absurdly.
+# NOTE: this models current as proportional to TRAVEL only. It deliberately does not
+# model locked-rotor draw, so a joint pinned by a soft obstruction reads flat here,
+# identical to a failed-open one. On the real arm a jam sags the pack hard. See
+# calibrate._raise_unseen_motion for what that limitation does and does not affect.
 _BATTERY_SAG_PER_UNIT = 0.0004
 _BATTERY_SAG_FLOOR_V = 3.0
 

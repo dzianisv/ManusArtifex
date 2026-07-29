@@ -119,16 +119,21 @@ class CalibrationAborted(CalibrationError):
 
 
 class JointUnresponsive(CalibrationError):
-    """Raised by the per-joint liveness check when one joint's actuator is dead.
+    """Raised when a joint's actuator is proven failed-open (disconnected servo).
 
     Subclasses ``CalibrationError`` and NOT ``ObserverError`` on purpose: this is a
     fact about a single joint's *hardware*, not about the observer's ability to see.
-    A dead joint (disconnected / failed-open, e.g. the real SHOULDER_LIFT / servo-5
-    fault: commanded across its band it moved less than the camera noise floor while
-    the pack stayed flat -- no current drawn -- see docs/hardware-fault-servo5.md)
-    produces the exact same "commanded motion, saw nothing" signal a mechanical stop
-    does, so without this stage the limit search would converge on a degenerate band
-    and mark a dead joint calibrated: confidently wrong.
+    A dead joint (e.g. the real SHOULDER_LIFT / servo-5 fault: commanded across its
+    band it moved less than the camera noise floor while the pack stayed flat -- no
+    current drawn -- see docs/hardware-fault-servo5.md) produces the exact same
+    "commanded motion, saw nothing" signal a blind camera does. Distinguishing them
+    is ``_raise_unseen_motion``'s job, and it does so at the one place the search
+    already has known-real motion to reason about: the observer-reliability burst.
+
+    Detected at **zero extra commanded motion** -- the burst's moves have already
+    happened, and the verdict is read from pack voltage and stall time around them.
+    Before this existed, a failed-open servo was reported as ``CalibrationAborted``
+    blaming the *camera*, which is the wrong component to send someone to inspect.
 
     Because it does not invalidate the *measurement process* -- the camera is fine,
     the other joints are fine -- ``calibrate`` treats it differently from every
@@ -260,41 +265,6 @@ class CalibrationSettings:
     #: counter matters.
     max_ambiguous_observations: int = 16
 
-    #: Run the per-joint liveness excursion (stage 2) before the limit search.
-    #:
-    #: **Default OFF, deliberately, and this is the honest part.** The check itself is
-    #: implemented and correct (see ``_liveness_targets`` / ``_verify_joint_liveness``),
-    #: but it cannot be shown *safe* to run by default without hardware measurements
-    #: this project does not currently have. The three constraints do not intersect:
-    #:
-    #:   * **Visibility** needs delta >= ~41 units, for the weakest *measured* joint
-    #:     (GRIP, 42.9 px/unit) at ``VISION_HEALTH_SEPARATION`` 3.0 over a 580 px noise
-    #:     floor -- with zero margin left over for WRIST_ROLL / WRIST_FLEX / ELBOW,
-    #:     which have never been measured at all.
-    #:   * **Battery corroboration** -- the strongest dead-servo signal this project
-    #:     has, and how servo 5 was actually diagnosed -- needs >= 125 units of travel
-    #:     to clear the 0.05 V detection epsilon.
-    #:   * **Stall-freedom** caps delta at 45 units on the narrowest joint the suite
-    #:     models (GRIP with stops at 1855/2045: only 45 units of headroom below its
-    #:     1900 centre).
-    #:
-    #: 125 > 45, so no fixed delta satisfies both battery corroboration and
-    #: stall-freedom. Even ignoring the battery, the vision-only window is [41, 45] --
-    #: four units wide, with no allowance for the three unmeasured joints. Picking a
-    #: number inside that window would be fitting a test fixture, not engineering, and
-    #: would silently mis-declare weak joints dead: the same class of bug that produced
-    #: the original bogus measurements.
-    #:
-    #: The root cause is structural, not a bad constant: with no position feedback the
-    #: centre is the *only* safe point, and ``centre +/- delta`` is not safe by
-    #: construction for ANY delta > 0, because a mechanical stop may sit anywhere.
-    #:
-    #: TODO(hardware): measure px-per-unit for WRIST_ROLL, WRIST_FLEX and ELBOW, and
-    #: the true mechanical range of every joint, then re-derive delta and flip this
-    #: default. Blocked: SHOULDER_LIFT (servo 5) is dead and the arm is powered down.
-    #: Until then a dead joint is caught by the search's own observer-reliability
-    #: burst, which aborts the run rather than silently calibrating it.
-    liveness_check: bool = False
 
     def __post_init__(self) -> None:
         def _int(name: str, value: Any, lo: int, hi: int) -> None:
@@ -331,11 +301,6 @@ class CalibrationSettings:
         _int("max_torque_ms", self.max_torque_ms, 1, 3_600_000)
         _int("max_stall_ms", self.max_stall_ms, 0, 3_600_000)
         _int("max_ambiguous_observations", self.max_ambiguous_observations, 0, 1000)
-        if not isinstance(self.liveness_check, bool):
-            raise CalibrationRefused(
-                f"liveness_check must be a bool, got {self.liveness_check!r} "
-                f"({type(self.liveness_check).__name__})."
-            )
         config.validate_duration_ms(self.step_duration_ms, allow_none=False)
         if self.step_duration_ms >= MAX_STEP_DURATION_MS:
             raise CalibrationRefused(
@@ -409,7 +374,7 @@ class CalibrationRun:
     torque_ms: int
     stall_ms: Optional[float]
     output_path: Optional[Path] = None
-    #: Joints that failed the per-joint liveness stage (name -> diagnostic message).
+    #: Joints proven failed-open during the search (name -> diagnostic message).
     #: A joint here is a proven-dead actuator: it is deliberately kept OUT of
     #: ``joints`` so the written file never records a band for it and its config.json
     #: ``calibrated`` flag stays false. Present so a run can report "5 calibrated, 1
@@ -603,7 +568,7 @@ def _start_position(name: str, lo: int, hi: int) -> int:
 
 
 def _torque_burst(
-    arm, name: str, target: int, settings: CalibrationSettings, budget: _Budget, *, probe: bool = True
+    arm, name: str, target: int, settings: CalibrationSettings, budget: _Budget
 ) -> None:
     """One bounded step: command it, wait for it, then unload before observing.
 
@@ -613,18 +578,12 @@ def _torque_burst(
     not an anomaly to raise ``StallDetected`` for. This routine does its own,
     graceful no-motion handling immediately below the call site.
 
-    ``probe`` (default ``True``) selects the *limit-search* posture: the widened
-    ``search_bounds`` are only reachable with ``probe_absolute_bounds=True`` (and
-    the ``allow_uncalibrated_override`` + reason that gates it), because otherwise
-    ``SafetyLayer`` would refuse anything outside ``config.effective_bounds``. It is
-    still audited, still requires the override + reason, and is still subject to
-    ``SafetyLayer``'s unconditional absolute-rail backstop.
-
-    ``probe=False`` is the *liveness* posture: the target is inside the joint's
-    provisional band (== its uncalibrated ``effective_bounds``), so it needs
-    NEITHER capability -- no ``probe_absolute_bounds``, no override. The liveness
-    check must not borrow elevated privilege to prove a joint moves; a move it can
-    only make with the rails unlocked is not the move a normal command would make.
+    ``probe_absolute_bounds=True`` is what makes the widened ``search_bounds``
+    actually reachable: without it ``SafetyLayer`` would check this target against
+    ``config.effective_bounds`` (the configured band) and refuse anything outside
+    it, even with the override applied. It is still audited, still requires the
+    override + reason below, and is still subject to ``SafetyLayer``'s
+    unconditional absolute-rail backstop.
 
     The budget is charged the *actual* commanded torque, not one nominal burst.
     A probe step is 30 units and is always a single packet, but the re-centering
@@ -643,12 +602,9 @@ def _torque_burst(
         duration_ms=settings.step_duration_ms,
         wait=True,
         vision_guard=None,
-        allow_uncalibrated_override=probe,
-        probe_absolute_bounds=probe,
-        override_reason=(
-            f"auto-calibration probe for {name} (bounded {settings.step_duration_ms}ms burst)"
-            if probe else None
-        ),
+        allow_uncalibrated_override=True,
+        probe_absolute_bounds=True,
+        override_reason=f"auto-calibration probe for {name} (bounded {settings.step_duration_ms}ms burst)",
     )
     # Unload through SafetyLayer *before* observing -- bounded exposure per step is
     # the entire safety argument for this routine. Deliberately not arm.relax(),
@@ -676,217 +632,229 @@ def _capture(observer: MotionObserver, context: str):
         raise ObserverError(f"observer failed to capture ({context}): {exc}") from exc
 
 
-#: Battery-drop threshold, in volts, that separates "the servo drew current" from
-#: "the pack stayed flat" during the liveness legs. The real servo-5 fault showed a
-#: pack that "stayed flat" across a full-band command (no current = disconnected /
-#: failed-open); a live servo turning a load sags the pack measurably. 0.05 V sits
-#: at the low end of the task's 0.05-0.10 V window: small enough to catch the light
-#: load of a short liveness excursion, large enough to ignore reading jitter. It is
-#: only ever used to *soften* a dead verdict (see ``_verify_joint_liveness``), never
-#: to manufacture one, so erring small is the safe direction.
-_LIVENESS_BATTERY_EPSILON_V = 0.05
+#: Pack-voltage sag at or below which the pack counts as "stayed flat", in volts.
+#:
+#: This is a *measurement floor*, not a physical property of the servo: ADC
+#: quantisation, pack ripple and load from the other five joints all wander the
+#: reading by a few tens of millivolts even when nothing is commanded. A sag this
+#: small is indistinguishable from noise, so we refuse to call it current draw.
+#:
+#: It is deliberately as LOW as the noise allows. The two populations being
+#: separated are "live joint under command" (sags by however much its load draws)
+#: and "failed-open joint" (draws nothing, so sags *exactly zero*). Because the
+#: dead case sits at zero, pushing this floor down widens the margin against a
+#: *false conviction* of a healthy joint -- the error direction that matters, since
+#: convicting a good servo sends an operator to replace working hardware.
+_BATTERY_NOISE_FLOOR_V = 0.02
+
+#: Nominal pack sag per unit of commanded travel, in volts.
+#:
+#: REASONED FROM THE SIMULATOR, NOT MEASURED ON THIS ARM. ``sim.py`` models sag as
+#: a linear 0.0004 V/unit. The real arm's figure is unknown and cannot be measured
+#: while it is powered down with servo 5 dead, so this is used only to decide
+#: whether a burst is *large enough to bother reasoning about* -- never to predict
+#: an expected voltage or to convict on a shortfall.
+_BATTERY_SAG_PER_UNIT_V = 0.0004
+
+#: How far a live joint's expected sag must clear the noise floor before a flat
+#: reading is allowed to mean anything.
+#:
+#: Why this exists at all -- the defect it fixes. A fixed voltage epsilon is only
+#: valid for the burst size it was derived against. The previous constant (0.05 V)
+#: was sized for the shipped ``step=30``, where a live joint sags ~0.096 V in sim
+#: (1.9x). But ``step`` is a user setting and ``step=15`` is an explicitly supported
+#: finer run (see ``derive_torque_budget``); at ``step=15`` a live joint sags only
+#: ~0.048 V, *below* the old epsilon -- so a perfectly healthy joint on a legal
+#: configuration would have been convicted as failed-open. Measured sweep, sim,
+#: ELBOW: step 30 -> 0.096 V, 15 -> 0.048 V, 10 -> 0.032 V, 5 -> 0.016 V, 1 ->
+#: 0.003 V. The signal scales with the burst, so the decision has to as well.
+#:
+#: With a 2x margin the check stays armed for the shipped step=30 (expected 0.096 V,
+#: 4.8x the noise floor) and for step=15 (0.048 V, 2.4x), and *disarms itself* below
+#: roughly step=13, where a live joint's sag is no longer reliably above noise. When
+#: disarmed the code does not guess: it declines to convict and reports the
+#: blind-camera diagnosis instead. Refusing to diagnose is the correct failure mode
+#: here -- the alternative is exactly the silent-threshold bug that produced the
+#: original bogus measurements.
+_BATTERY_TRUST_MARGIN = 2.0
+
+
+def _battery_signal_is_trustworthy(commanded_travel: int) -> bool:
+    """Would a *live* joint sag the pack measurably over a burst this size?
+
+    If not, a flat reading carries no information -- a healthy joint and a dead one
+    both read as flat -- and must not be used to convict. Returns False for a burst
+    too small to reason about, in which case the caller falls back to the
+    blind-camera diagnosis.
+    """
+    expected_sag = commanded_travel * _BATTERY_SAG_PER_UNIT_V
+    return expected_sag >= _BATTERY_NOISE_FLOOR_V * _BATTERY_TRUST_MARGIN
 
 
 def _read_battery(arm) -> Optional[float]:
     """Read pack voltage, or ``None`` if the read fails. Never raises.
 
     A battery read is a diagnostic nicety, not a precondition: a controller that
-    cannot answer ``get_battery_voltage`` must not crash the liveness check, it must
-    just leave the voltage out of the diagnosis.
+    cannot answer ``get_battery_voltage`` must not crash the search, it must just
+    leave the voltage out of the diagnosis.
     """
     try:
         return float(arm.battery_voltage())
-    except Exception:  # a transport that cannot report voltage is not a liveness failure
+    except Exception:  # a transport that cannot report voltage is not a fault verdict
         return None
 
 
-#: Half-amplitude of the liveness excursion, in raw units, measured from the joint's
-#: safe centre. **Reasoned from hardware data, not measured at this delta** -- see the
-#: honest-limits note in ``CalibrationSettings.liveness_check``.
-#:
-#: Derivation from the 2026-07-28 hardware session (docs/verification-camera.md):
-#:   * camera noise floor, warmed up and flushed: 450-580 changed px (use 580, worst)
-#:   * SHOULDER_PAN across its ~600-unit band: 78,116 px -> 130.2 px per unit
-#:   * GRIP across its ~600-unit band:          25,746 px ->  42.9 px per unit
-#:   * dead SHOULDER_LIFT across its full band: 230-330 px, i.e. BELOW the floor
-#: GRIP is the weakest *measured* joint. ``config.VISION_HEALTH_SEPARATION`` (3.0)
-#: demands 580 * 3 = 1,740 px, so GRIP alone needs only ~41 units. 150 units gives
-#: GRIP 6,436 px = 11.1x the floor -- 3.7x more margin than the separation demands.
-#: Stated as a *coverage* bound: 150 units still clears 3.0x for any joint down to
-#: 11.6 px/unit, i.e. one 3.7x weaker than the weakest joint ever measured. That
-#: margin is what absorbs WRIST_ROLL / WRIST_FLEX / ELBOW, for which NO px-per-unit
-#: figure exists -- an unmeasured allowance, not a measurement.
-#: It also clears the simulator's battery-sag epsilon: 150 * 0.0004 V = 0.060 V > 0.05 V.
-LIVENESS_DELTA = 150
+def _read_stall_total(arm) -> Optional[float]:
+    """Cumulative stall time the transport has observed, or ``None`` if it cannot say.
 
-
-def _liveness_center(name: str) -> int:
-    """The one position for this joint that is safe to command *without* knowing where
-    its mechanical stops are: the midpoint of its ABSOLUTE (electrical) range.
-
-    With no position feedback the only position we can reason about is the one we
-    most recently commanded, and the only one that is safe by construction is the
-    electrical midpoint -- it cannot be past a mechanical stop on either side,
-    because the stops necessarily lie inside the electrical range.
-
-    Note this is deliberately ``absolute_bounds``, NOT a flat 1500. For five joints
-    those agree (700..2300 -> 1500), but **GRIP does not**: its electrical floor is
-    1500, so its midpoint is 1900, and 1500 is GRIP's *open mechanical stop* rather
-    than a safe centre. Commanding GRIP to a hardcoded 1500 to "home" it would drive
-    it onto that stop -- the same class of mistake as the GRIP=700 command that
-    destroyed the gripper on 2026-07-28.
+    Real hardware cannot report stalls (that is the whole reason vision exists here),
+    so this is ``None`` off-simulator and every caller must treat it as "unknown"
+    rather than "zero". Never raises.
     """
-    lo, hi = config.absolute_bounds(name)
-    return (lo + hi) // 2
-
-
-def _liveness_targets(name: str, delta: int = LIVENESS_DELTA) -> Tuple[int, int, int]:
-    """``(centre, centre - d, centre + d)`` -- a symmetric excursion about the safe centre.
-
-    This deliberately inverts the original derivation, which took targets from the
-    *provisional band*. That band is by definition WIDER than the true mechanical
-    range (its whole reason to exist is that the real limits are unknown and assumed
-    to lie outside it), so a target drawn from it can never be known-reachable: the
-    old code sent GRIP to 1800/2100 against true stops at 1855/2045 and stalled the
-    servo on both legs. Deriving from the centre instead means the target is at most
-    ``delta`` from a point that is safe by construction.
-
-    ``d`` is additionally clamped into the provisional band so the excursion needs no
-    elevated privilege (``probe=False``: no ``probe_absolute_bounds``, no uncalibrated
-    override). A move that can only be made with the rails unlocked is not the move a
-    normal command would make, so it would not prove what liveness needs to prove.
-    """
-    centre = _liveness_center(name)
-    lo, hi = config.provisional_bounds(name)
-    d = max(1, min(int(delta), centre - lo, hi - centre))
-    return centre, centre - d, centre + d
-
-
-def _verify_joint_liveness(
-    arm,
-    name: str,
-    settings: CalibrationSettings,
-    observer: MotionObserver,
-    budget: _Budget,
-    health: CameraHealthReport,
-) -> None:
-    """Stage 2 of the pipeline: prove this joint's actuator is actually alive.
-
-    Runs AFTER the camera-health gate (stage 1: is the sensor trustworthy?) and
-    BEFORE the limit search (stage 3: where are the stops?). Each stage is
-    meaningless unless the previous one passed: "no motion" is only evidence of a
-    mechanical stop once we know the camera can see and the servo can move. A
-    completely dead joint (disconnected / failed-open -- the servo-5 fault) emits the
-    exact "commanded, saw nothing" signal a stop does, so without this the search
-    would converge on a degenerate band and mark it calibrated.
-
-    Two legs, opposite directions, symmetric about the joint's safe centre (see
-    ``_liveness_targets``) and clamped into the provisional band, so ``probe=False``:
-    no elevated privilege. The joint is first homed to that centre, because an
-    excursion is only bounded if we know where it started from.
-    Each leg's changed-pixel score must clear the *already-measured* noise floor in
-    ``health`` via the shared ``camera_health.motion_clears_floor`` primitive (no
-    per-joint re-sampling). If either leg fails to be seen, the joint is *provisionally*
-    dead -- but a blind camera on a live joint produces the same silence, so before
-    raising we consult an independent channel: the battery. A joint that really
-    moved drew current and sagged the pack; a joint that failed *open* drew nothing
-    and left it flat. Only "not seen AND no current drawn (or voltage unreadable)"
-    is reported as a dead actuator; "not seen BUT current WAS drawn" means the servo
-    is electrically alive and the camera simply missed it, which is the limit
-    search's observer-reliability burst's job to adjudicate (it aborts the whole run
-    as ``CalibrationAborted`` if the observer truly cannot see this joint) -- not a
-    hardware verdict liveness can support. The joint is unloaded before any raise so
-    it is never left under torque.
-    """
-    centre, down, up = _liveness_targets(name)
-    legs = [("-", down), ("+", up)]
-
-    v_before = _read_battery(arm)
-    results: List[Tuple[str, int, float, float, bool]] = []
+    reader = getattr(getattr(arm, "_transport", None), "stall_ms_total", None)
+    if reader is None:
+        return None
     try:
-        # Home first: the excursion is only bounded relative to a known start, and
-        # the centre is the sole position that is safe without knowing the stops.
-        _torque_burst(arm, name, centre, settings, budget, probe=False)
-        for tag, target in legs:
-            before = _capture(observer, f"{name} liveness leg {tag} before")
-            _torque_burst(arm, name, target, settings, budget, probe=False)
-            after = _capture(observer, f"{name} liveness leg {tag} after")
-            score, floor, ok = camera_health.motion_clears_floor(
-                observer, before, after, health, separation=config.VISION_HEALTH_SEPARATION
-            )
-            results.append((tag, target, score, floor, ok))
-    finally:
-        # Never leave the joint under torque, whatever happened above.
-        arm._safety.unload([name])
-    v_after = _read_battery(arm)
-
-    if all(ok for _, _, _, _, ok in results):
-        return  # alive and plainly visible: stages 2 done, hand off to the search
-
-    drew_current = (
-        v_before is not None
-        and v_after is not None
-        and (v_before - v_after) > _LIVENESS_BATTERY_EPSILON_V
-    )
-    if drew_current:
-        # The actuator IS electrically alive (it pulled the pack down turning a
-        # load); the camera just could not confirm the motion. That is a *sight*
-        # problem, not a dead joint. Defer: the search's observer-reliability burst
-        # owns "cannot reliably see this joint" and will abort the whole run there
-        # if so. Liveness must not pre-empt it with a hardware verdict it cannot
-        # support from a single unseen move.
-        logger.warning(
-            "%s: liveness legs were not clearly seen, but the pack sagged "
-            "%.2fV -> %.2fV (current was drawn), so the actuator is alive and the "
-            "camera missed the motion. Deferring to the search's observer-reliability "
-            "check rather than declaring the joint dead.",
-            name, v_before, v_after,
-        )
-        return
-
-    raise JointUnresponsive(_liveness_failure_message(name, results, v_before, v_after))
+        return float(reader())
+    except Exception:  # a transport that cannot report stalls is not a verdict
+        return None
 
 
-def _liveness_failure_message(
+def _dead_servo_message(
     name: str,
-    results: List[Tuple[str, int, float, float, bool]],
-    v_before: Optional[float],
-    v_after: Optional[float],
+    misses: int,
+    moves: int,
+    v_before: float,
+    v_after: float,
 ) -> str:
-    lo, hi = config.provisional_bounds(name)
-    legs_txt = "; ".join(
-        f"leg {tag} -> {target}: scored {score:.0f} changed px vs required floor "
-        f"{floor:.0f} ({'seen' if ok else 'NOT seen'})"
-        for tag, target, score, floor, ok in results
-    )
+    """Diagnosis for a joint that failed the reliability burst with a flat pack.
+
+    Voltage is required, not optional: a flat pack is the only evidence that
+    actually separates a failed-open servo from a camera that cannot see it, so the
+    caller never convicts without it.
+    """
+    drop = v_before - v_after
     parts = [
-        f"{name}: unresponsive. Two probe excursions inside the provisional band "
-        f"[{lo}, {hi}] produced no clearly-visible motion -- {legs_txt}.",
+        f"{name}: unresponsive (actuator appears failed-open). The observer saw none "
+        f"of {misses} of {moves} reliability-burst moves -- an oscillation between two "
+        "positions this joint had already been watched to reach, so those moves were "
+        "known-real and should have been plainly visible.",
     ]
-    if v_before is not None and v_after is not None:
-        drop = v_before - v_after
-        if abs(drop) <= _LIVENESS_BATTERY_EPSILON_V:
-            parts.append(
-                f"Battery stayed flat ({v_before:.2f}V -> {v_after:.2f}V, "
-                f"delta {drop:+.2f}V): consistent with a disconnected / failed-open "
-                "servo drawing no current, not a mechanical jam."
-            )
-        else:
-            parts.append(
-                f"Battery sagged ({v_before:.2f}V -> {v_after:.2f}V, "
-                f"delta {drop:+.2f}V): consistent with the servo drawing current "
-                "against something -- check for a mechanical obstruction / jam."
-            )
-    else:
-        parts.append(
-            "Battery voltage was unavailable, so current draw could not be checked; "
-            "the per-leg scores above are the only evidence."
-        )
     parts.append(
-        "See docs/hardware-fault-servo5.md for how to tell a dead servo from a jam "
-        "and what to inspect (cable seating, connector, servo swap)."
+        f"Across the whole burst the pack stayed flat ({v_before:.2f}V -> "
+        f"{v_after:.2f}V, delta {drop:+.3f}V, within the "
+        f"{_BATTERY_NOISE_FLOOR_V}V measurement noise floor) and the transport "
+        "reported no stall time. No motion, no current drawn and nothing pushed "
+        "against: that is the signature of a disconnected / failed-open servo, "
+        "not of a camera that cannot see. A jammed-but-live servo would have "
+        "drawn locked-rotor current and sagged the pack, or accrued stall time "
+        "pushing against a stop."
+    )
+    parts.append(
+        "This is the real SHOULDER_LIFT / servo-5 fault signature. See "
+        "docs/hardware-fault-servo5.md for how to tell a dead servo from a jam and "
+        "what to inspect (cable seating, connector, servo swap)."
     )
     return " ".join(parts)
+
+
+def _raise_unseen_motion(
+    name: str,
+    misses: int,
+    moves: int,
+    settings: "CalibrationSettings",
+    v_before: Optional[float],
+    v_after: Optional[float],
+    stall_before: Optional[float],
+    stall_after: Optional[float],
+    commanded_travel: int,
+) -> None:
+    """The reliability burst failed. Decide *why*, then raise. Never returns.
+
+    The burst commands known-real motion and the observer saw none of it. Two very
+    different faults produce that identical signal, and until now both were reported
+    as the first one:
+
+    * **The camera cannot see this joint** (occlusion, bad ROI, dead camera, bad
+      angle) -> ``CalibrationAborted``, as before. The joint moved; we just could
+      not watch it.
+    * **The actuator is failed-open** (disconnected servo -- the real SHOULDER_LIFT /
+      servo-5 fault) -> ``JointUnresponsive``. Nothing moved at all, and the camera
+      is fine.
+
+    The discriminator is current draw, which is free here: the burst's moves have
+    already happened, so reading pack voltage either side of them adds no motion.
+    A servo that turned a load sags the pack; one that failed open draws nothing and
+    leaves it flat. Flat pack + unseen motion + no stall accrued = failed-open.
+
+    Requiring "no stall accrued" as well is what keeps a *jam* from being convicted:
+    a servo pushing against a mechanical stop is electrically alive, and the
+    transport charges that as stall time. A sagging pack likewise acquits.
+
+    **Known limit, stated honestly.** This separates failed-open from a
+    *mechanical-stop* jam, which stalls, and (on real hardware) from a locked-rotor
+    jam, which draws MORE current than free running and sags the pack hard. It does
+    NOT separate failed-open from a joint pinned by a soft obstruction in
+    *simulation*, because ``sim`` models current as proportional to travel and does
+    not model locked-rotor draw at all -- so a pinned joint reads flat there,
+    identical to a dead one. That is a limitation of the simulator's battery model,
+    not of the rule; it cannot be validated either way while the arm is powered down
+    and servo 5 is dead. When voltage is unreadable the verdict falls back to the
+    unseen-motion plus no-stall evidence alone, and the message says so.
+    """
+    have_voltage = v_before is not None and v_after is not None
+    sag = (v_before - v_after) if have_voltage else None
+    # A burst too small for a live joint to sag the pack measurably makes a flat
+    # reading meaningless -- healthy and dead look identical -- so the battery
+    # evidence is withheld entirely rather than guessed at.
+    trustworthy = _battery_signal_is_trustworthy(commanded_travel)
+    drew_current = have_voltage and trustworthy and sag > _BATTERY_NOISE_FLOOR_V
+    stalled = (
+        stall_before is not None
+        and stall_after is not None
+        and (stall_after - stall_before) > 0.0
+    )
+    # Conviction needs positive, usable evidence of a flat pack. Without a
+    # trustworthy battery signal we cannot tell a dead servo from a blind camera,
+    # so we decline to diagnose rather than risk condemning working hardware.
+    if not stalled and have_voltage and trustworthy and not drew_current:
+        raise JointUnresponsive(
+            _dead_servo_message(name, misses, moves, v_before, v_after)
+        )
+
+    if drew_current:
+        why = "the pack sagged (current was drawn)"
+    elif stalled:
+        why = "stall time accrued"
+    elif not have_voltage:
+        why = "pack voltage could not be read, so it could not be cleared or convicted"
+    else:
+        why = (
+            f"this {commanded_travel}-unit burst is too small for a live joint to sag "
+            "the pack measurably, so the current check was withheld"
+        )
+    if drew_current or stalled:
+        verdict = (
+            f"The actuator itself is alive ({why}), so this is a sight problem, not "
+            "a dead servo."
+        )
+    else:
+        # Honest about the gap: we did NOT clear the actuator, we just could not
+        # test it. Saying "alive" here would be asserting evidence we never had.
+        verdict = (
+            f"The actuator could NOT be cleared or convicted here ({why}), so a "
+            "failed-open servo is not ruled out -- re-run with a coarser step to "
+            "enable the current check if the camera checks out."
+        )
+    raise CalibrationAborted(
+        f"{name}: the observer missed {misses} of {moves} moves that "
+        "definitely happened (an oscillation between two positions it had already "
+        f"watched the joint reach), more than the {settings.max_verification_misses} "
+        "allowed. It cannot reliably see this joint -- occlusion, a bad ROI, a dead "
+        "camera, lighting, or a viewing angle that makes this joint's motion nearly "
+        "invisible. Its 'no motion' reports are therefore not evidence of a "
+        f"mechanical stop. {verdict} Aborting without writing a result."
+    )
 
 
 def _search_direction(
@@ -969,6 +937,12 @@ def _search_direction(
                 f"{current} -- refusing to record a limit on unverified evidence."
             )
         sequence = [near if i % 2 == 0 else far for i in range(settings.verification_moves)]
+        # Sampled around the burst the search is ALREADY performing -- these reads
+        # command no motion of their own. They are what lets a failed-open actuator
+        # be told apart from a camera that cannot see, below.
+        burst_start = current
+        v_before = _read_battery(arm)
+        stall_before = _read_stall_total(arm)
         misses = 0
         for target in sequence:
             probe_before = _capture(observer, f"{name} reliability probe before")
@@ -979,14 +953,15 @@ def _search_direction(
             if not moved_back:
                 misses += 1
         if misses > settings.max_verification_misses:
-            raise CalibrationAborted(
-                f"{name}: the observer missed {misses} of {len(sequence)} moves that "
-                "definitely happened (an oscillation between two positions it had already "
-                f"watched the joint reach), more than the {settings.max_verification_misses} "
-                "allowed. It cannot reliably see this joint -- occlusion, a bad ROI, a dead "
-                "camera, lighting, or a viewing angle that makes this joint's motion nearly "
-                "invisible. Its 'no motion' reports are therefore not evidence of a "
-                "mechanical stop. Aborting without writing a result."
+            # Travel the burst actually commanded, used to decide whether the pack
+            # reading is meaningful. Computed from the sequence rather than assumed.
+            commanded_travel = abs(sequence[0] - burst_start) + sum(
+                abs(b - a) for a, b in zip(sequence, sequence[1:])
+            )
+            _raise_unseen_motion(
+                name, misses, len(sequence), settings,
+                v_before, _read_battery(arm), stall_before, _read_stall_total(arm),
+                commanded_travel,
             )
 
     # Always start each direction from the same known-safe place so the two
@@ -1163,17 +1138,6 @@ def calibrate_joint(
             "plus the two-step retreat the observer-reliability burst oscillates over."
         )
 
-    # Stage 2 of the pipeline: prove the actuator is alive before believing any
-    # "no motion" the search reports. OPT-IN (``settings.liveness_check``, default
-    # False) -- not because the check is unfinished, but because no excursion size
-    # is simultaneously visible enough to trust and small enough to be provably
-    # stall-free without knowing each joint's true mechanical range. The full
-    # numeric argument is on ``CalibrationSettings.liveness_check``. When enabled,
-    # no path (via ``calibrate`` or a direct ``calibrate_joint`` call) can reach
-    # ``_search_direction`` without it: a dead joint raises ``JointUnresponsive``
-    # here and never reaches the search.
-    if settings.liveness_check:
-        _verify_joint_liveness(arm, key, settings, observer, budget, health)
 
     torque_before = budget.torque_ms
     stall_before = budget.stall_ms
@@ -1238,8 +1202,8 @@ def calibrate(
     """Calibrate one or more joints and, on success only, write a result file.
 
     Failure handling is deliberately asymmetric, and the asymmetry is the whole
-    point of the three-stage pipeline (camera health -> per-joint liveness -> limit
-    search):
+    point of the two-stage pipeline (camera health gate -> limit search, with the
+    search's own reliability burst doubling as the failed-open detector):
 
     * Almost every failure aborts the ENTIRE run and writes NOTHING --
       ``CalibrationRefused`` (before any motion), ``CameraUnusableError`` and the

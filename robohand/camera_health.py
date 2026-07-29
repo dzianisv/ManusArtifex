@@ -260,7 +260,7 @@ def motion_clears_floor(
 
     The single, exception-free primitive behind BOTH the camera-health gate's
     visibility spot-check (``verify_motion_visibility`` -> ``CameraUnusableError``)
-    and ``calibrate.py``'s per-joint liveness check (-> ``JointUnresponsive``).
+    and ``calibrate.py``'s search-time motion checks.
     Returns ``(score, required_floor, ok)`` where
 
         required_floor = max(observer.motion_threshold(), report.noise_p95 * separation)
