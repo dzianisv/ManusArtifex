@@ -810,6 +810,16 @@ def apply_calibration(
         if not isinstance(center, int) or isinstance(center, bool) or not (lo <= center <= hi):
             spec["center"] = (lo + hi) // 2
         spec["calibration_source"] = str(path.name)
+        # The shipped comments say "PROVISIONAL ... NOT calibrated". Leaving them in
+        # place next to calibrated:true would be actively misleading to the next
+        # human who opens this file, so replace them with honest provenance.
+        spec["comment"] = (
+            f"Auto-calibrated from {path.name} "
+            f"(min: {entry.get('min_finding', 'unknown')}, max: {entry.get('max_finding', 'unknown')}, "
+            f"margin {entry.get('margin', '?')} raw units per end, observed via "
+            f"{payload.get('observer', 'unknown observer')}). Vision-derived, open loop, "
+            "not a hand-measured value -- cross-check by hand before trusting it with a payload."
+        )
         # Fail before writing, not after: this is the same validation config.py runs
         # at import, so a spec that would break the next import is rejected here.
         config._validate_servo_spec(key, spec)

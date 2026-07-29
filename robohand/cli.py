@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -26,9 +27,20 @@ from .safety import CalibrationRequired, SafetyViolation
 from .guard import StallDetected
 
 
+def _is_simulated(args: argparse.Namespace) -> bool:
+    """True when this invocation will run against a simulated transport.
+
+    Deliberately mirrors ``arm._use_sim`` (flag OR ``ROBOHAND_TRANSPORT=sim``) so
+    the operator-presence gate below can never disagree with which transport
+    ``_make_arm`` is actually about to open.
+    """
+    if getattr(args, "sim", False) or getattr(args, "dry_run", False):
+        return True
+    return os.environ.get("ROBOHAND_TRANSPORT", "").strip().lower() == "sim"
+
+
 def _make_arm(args: argparse.Namespace) -> Arm:
     return Arm(sim=getattr(args, "sim", False), dry_run=getattr(args, "dry_run", False))
-
 
 
 def _print_positions(positions: dict, as_json: bool) -> None:
@@ -258,6 +270,100 @@ def cmd_pick(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    """Vision-guided auto-calibration, or promotion of an earlier result.
+
+    Three modes, deliberately not overlapping: ``--apply FILE`` (no motion at all,
+    just merges a previous result into config.json), ``--joint NAME`` (calibrate
+    one), ``--all`` (calibrate every joint).
+    """
+    from . import calibrate as calibration
+
+    if args.apply:
+        applied = calibration.apply_calibration(
+            Path(args.apply),
+            joints=args.joint or None,
+            allow_simulated=args.allow_simulated,
+        )
+        print(f"Promoted calibration from {args.apply} into config.json:")
+        for name, spec in sorted(applied.items()):
+            print(f"  {name:<14} [{spec['min']}, {spec['max']}] center={spec['center']} calibrated=true")
+        print(
+            "These joints are no longer restricted to the provisional band. Re-run "
+            "'robohand doctor' to confirm, and re-verify by hand before trusting the "
+            "new range with a payload."
+        )
+        return 0
+
+    if not args.joint and not args.all:
+        print("error: provide --joint NAME (repeatable), --all, or --apply FILE", file=sys.stderr)
+        return 2
+    if args.joint and args.all:
+        print("error: --joint and --all are mutually exclusive", file=sys.stderr)
+        return 2
+
+    # Operator-presence gate. Checked BEFORE _make_arm(), so a missing flag can
+    # never open the real HID device even for a moment.
+    if not _is_simulated(args) and not args.i_am_present_and_watching:
+        print(
+            "REFUSING TO RUN.\n"
+            "\n"
+            "Auto-calibration drives each joint toward its unknown mechanical stops. It\n"
+            "is bounded (small steps, sub-500ms torque bursts, unload after every step,\n"
+            "hard torque/time budgets), but it is still deliberate motion into the\n"
+            "unknown on an arm with no position feedback.\n"
+            "\n"
+            "Run it only with a human physically present, watching the arm, with the\n"
+            "power switch within reach, the workspace clear, and (for GRIP) the jaws\n"
+            "empty and unobstructed.\n"
+            "\n"
+            "Re-run with --i-am-present-and-watching to confirm, or add --sim to\n"
+            "rehearse the whole routine against the simulator with no hardware access.",
+            file=sys.stderr,
+        )
+        return 2
+
+    settings_kwargs = {}
+    for attr, key in (
+        ("step", "step"),
+        ("margin", "margin"),
+        ("confirmations", "confirmations"),
+        ("step_duration", "step_duration_ms"),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None:
+            settings_kwargs[key] = value
+    settings = calibration.CalibrationSettings(**settings_kwargs)
+
+    joints = args.joint if args.joint else None
+    with _make_arm(args) as arm:
+        try:
+            run = calibration.calibrate(
+                arm,
+                joints,
+                settings=settings,
+                output_dir=Path(args.out_dir) if args.out_dir else None,
+            )
+        except KeyboardInterrupt:
+            arm.relax()
+            print("\nInterrupted -- servos relaxed, no calibration written.", file=sys.stderr)
+            return 130
+
+    if args.json:
+        print(json.dumps(run.as_dict(), indent=2))
+    else:
+        print(f"Calibration complete ({run.elapsed_s:.1f}s, {run.torque_ms}ms commanded torque)")
+        print(f"Observer: {run.observer}")
+        for line in calibration.summarize(run):
+            print(line)
+        print(f"Written to: {run.output_path}")
+        print(
+            "config.json was NOT modified. Review the file above, then promote it with:\n"
+            f"  robohand calibrate --apply {run.output_path}"
+        )
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report device presence, per-joint calibration status, camera availability,
     and which safety layers are currently active. Never commands any motion."""
@@ -404,14 +510,61 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_doctor)
 
+    p = sub.add_parser(
+        "calibrate",
+        help="Vision-guided auto-calibration of a joint's real mechanical limits, "
+        "or promotion of a previous result into config.json",
+        description="Steps a joint in small, individually-unloaded torque bursts and uses a "
+        "camera (or, under --sim, a synthetic stand-in) to tell whether it actually moved. "
+        "Repeated no-motion is a candidate mechanical stop. Writes a timestamped result "
+        "file; never edits config.json unless you separately run --apply. "
+        "See docs/calibration.md for what this can and cannot detect.",
+    )
+    p.add_argument("--joint", action="append", metavar="NAME",
+                   help="Joint to calibrate (repeatable). With --apply, restricts which joints are promoted.")
+    p.add_argument("--all", action="store_true", help="Calibrate every joint")
+    p.add_argument("--apply", metavar="FILE",
+                   help="Promote a previous calibration-*.json into config.json (commands no motion)")
+    p.add_argument("--allow-simulated", action="store_true", dest="allow_simulated",
+                   help="With --apply, permit promoting a result produced against the simulator. "
+                   "Simulated limits are assumptions about this arm, not measurements of it.")
+    p.add_argument("--step", type=int, default=None, help="Probe increment in raw units (default 30)")
+    p.add_argument("--margin", type=int, default=None,
+                   help="Back-off from the last confirmed-moving position, in raw units (default 60)")
+    p.add_argument("--confirmations", type=int, default=None,
+                   help="Consecutive no-motion observations required before believing a stop (default 2, minimum 2)")
+    p.add_argument("--step-duration", type=int, default=None, dest="step_duration",
+                   help="Torque burst per step in ms (default config.MIN_DURATION_MS; must stay under 500)")
+    p.add_argument("--out-dir", default=None, dest="out_dir",
+                   help="Directory for the result file (default robohand/data/)")
+    p.add_argument("--i-am-present-and-watching", action="store_true", dest="i_am_present_and_watching",
+                   help="Required on real hardware: confirms a human is physically present, watching the "
+                   "arm, with the power switch in reach and the workspace (and gripper jaws) clear.")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_calibrate)
+
     return parser
 
 
 def main(argv: Optional[list] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Imported lazily-but-eagerly here (not inside the handler) so the except
+    # clauses below are bound before any command runs.
+    from .calibrate import CalibrationAborted, CalibrationRefused
+    from .observer import ObserverError
+
     try:
         return args.func(args)
+    except CalibrationRefused as e:
+        print(f"error: refusing to calibrate -- {e}", file=sys.stderr)
+        return 2
+    except CalibrationAborted as e:
+        print(f"error: calibration aborted, nothing written -- {e}", file=sys.stderr)
+        return 1
+    except ObserverError as e:
+        print(f"error: motion observer unusable -- {e}", file=sys.stderr)
+        return 1
     except CalibrationRequired as e:
         print(f"error: refusing to move -- {e}", file=sys.stderr)
         return 1
