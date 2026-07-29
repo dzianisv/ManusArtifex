@@ -176,7 +176,14 @@ class CalibrationSettings:
     #: which already blew the pre-fix 120,000ms default, because before the
     #: ``search_bounds`` fix the search could only ever crawl over the 300-unit
     #: provisional band and never had to sweep out to the rail.
-    max_torque_ms: int = 180_000
+    #:
+    #: **This default is a sentinel.** Leave it as ``None`` and it is DERIVED from
+    #: ``step``, ``step_duration_ms`` and ``verification_moves`` in ``__post_init__``
+    #: (see ``derive_torque_budget``). The arithmetic above is the *default-settings*
+    #: instance of that formula, not a constant that survives changing the knobs:
+    #: halving ``step`` doubles the probe packets, and a fixed 180,000 would then
+    #: abort a perfectly legitimate run. Pass an explicit int to override.
+    max_torque_ms: Optional[int] = None
 
     #: Cumulative simulated stall time. Only enforceable against ``SimTransport``
     #: (real hardware cannot report stalls -- that is the entire problem this
@@ -193,7 +200,12 @@ class CalibrationSettings:
     #: multiplies the *number of steps* but not the *number of stalling steps*.
     #: => 6 joints x 2 directions x 3 packets x 400ms = 14,400ms.
     #: Measured worst case: 14,000ms. Realistic ``--all``: 10,400ms.
-    max_stall_ms: int = 14_400
+    #:
+    #: **Sentinel, as above.** Left ``None`` it is derived from ``confirmations``
+    #: and ``step_duration_ms`` (see ``derive_stall_budget``). The 14,400 figure is
+    #: the default-settings instance: raising ``confirmations`` to 3 would make the
+    #: true worst case 19,200ms and a fixed 14,400 cap would abort every full run.
+    max_stall_ms: Optional[int] = None
 
     #: Wall-clock cap for the whole run. Each packet costs
     #: ``step_duration_ms + config.SETTLE_MARGIN_MS`` (500ms) plus observation
@@ -202,7 +214,10 @@ class CalibrationSettings:
     #: 900s leaves room for a real camera observer, which is far slower per
     #: observation than ``SimMotionObserver``, without being so loose that a hung
     #: run sits on the arm indefinitely.
-    max_wall_clock_s: float = 900.0
+    #:
+    #: **Sentinel, as above** -- derived from the packet count and per-packet cost,
+    #: with generous headroom for a real camera observer. Pass a number to override.
+    max_wall_clock_s: Optional[float] = None
 
     #: A no-motion report that a later observation contradicts (the joint moved
     #: again afterwards) is an *ambiguous* observation. A handful means a twitchy
@@ -243,6 +258,17 @@ class CalibrationSettings:
                 "observer-reliability check can never fail and is not a check."
             )
         _int("max_steps_per_direction", self.max_steps_per_direction, 1, 1000)
+        # Frozen dataclass: object.__setattr__ is the sanctioned way to fill in a
+        # derived default, and it keeps the instance immutable to everyone else.
+        if self.max_torque_ms is None:
+            object.__setattr__(self, "max_torque_ms", derive_torque_budget(
+                self.step, self.step_duration_ms, self.verification_moves))
+        if self.max_stall_ms is None:
+            object.__setattr__(self, "max_stall_ms", derive_stall_budget(
+                self.step_duration_ms, self.confirmations))
+        if self.max_wall_clock_s is None:
+            object.__setattr__(self, "max_wall_clock_s", derive_wall_clock_budget(
+                self.step, self.step_duration_ms, self.verification_moves))
         _int("max_torque_ms", self.max_torque_ms, 1, 3_600_000)
         _int("max_stall_ms", self.max_stall_ms, 0, 3_600_000)
         _int("max_ambiguous_observations", self.max_ambiguous_observations, 0, 1000)
@@ -399,6 +425,69 @@ class _Budget:
                 "reliable enough to trust a 'no motion means mechanical stop' inference "
                 "-- aborting without writing a result."
             )
+
+
+def derive_stall_budget(step_duration_ms: int, confirmations: int, joints: int = 6) -> int:
+    """Worst-case cumulative stall time for a run, derived from the settings.
+
+    Stall accrues only while the commanded target is beyond the true mechanical
+    stop. Once a step overshoots the stop the joint is pinned, so every subsequent
+    step in that direction is a no-motion miss and the direction terminates after
+    ``confirmations`` of them. The worst case per direction is therefore
+    ``1`` overshoot-that-still-moved ``+ confirmations`` pinned packets -- a count
+    set by ``confirmations``, NOT by how far the search is allowed to travel.
+    Widening the search multiplies the number of steps but not the number of
+    *stalling* steps.
+
+    This must be derived rather than hardcoded: at the shipped defaults it is
+    ``6 x 2 x 3 x 400 = 14,400ms``, but ``confirmations=3`` makes the true worst
+    case 19,200ms, and a fixed 14,400 cap would then abort every legitimate run.
+    """
+    return joints * 2 * (1 + confirmations) * step_duration_ms
+
+
+def derive_packet_budget(step: int, verification_moves: int, joints: int = 6) -> int:
+    """Worst-case number of commanded packets for a whole run.
+
+    Per joint and direction: ``ceil(widest_half_span / step)`` probe packets,
+    ``verification_moves`` reliability packets, and 1 retreat/settle packet.
+    Re-centring between and after the two directions crosses up to the full
+    half-span, which ``SafetyLayer`` ramps into ``ceil(half_span / MAX_STEP_PER_MOVE)``
+    packets, twice.
+    """
+    half_span = max(
+        max(center - lo, hi - center)
+        for name in config.JOINT_NAMES
+        for (lo, hi) in [search_bounds(name)]
+        for center in [(lo + hi) // 2]
+    )
+    probes = -(-half_span // step)
+    per_direction = probes + verification_moves + 1
+    recentre = 2 * max(1, -(-half_span // config.MAX_STEP_PER_MOVE))
+    return joints * (2 * per_direction + recentre)
+
+
+def derive_torque_budget(step: int, step_duration_ms: int, verification_moves: int, joints: int = 6) -> int:
+    """Worst-case cumulative commanded-torque time, derived from the settings.
+
+    Hardcoding this is a trap: halving ``step`` doubles the probe packets, so a
+    constant sized for ``step=30`` aborts a legitimate ``step=15`` run. The 1.05
+    factor absorbs an odd extra settle packet without being loose enough to stop
+    functioning as a safeguard.
+    """
+    return int(derive_packet_budget(step, verification_moves, joints) * step_duration_ms * 1.05)
+
+
+def derive_wall_clock_budget(step: int, step_duration_ms: int, verification_moves: int, joints: int = 6) -> float:
+    """Worst-case wall-clock seconds, derived from the settings.
+
+    Each packet costs ``step_duration_ms + config.SETTLE_MARGIN_MS`` plus
+    observation time. The 4x factor is headroom for a real camera observer, which
+    is far slower per observation than ``SimMotionObserver`` -- generous, but still
+    bounded, so a hung run cannot sit on the arm indefinitely.
+    """
+    packets = derive_packet_budget(step, verification_moves, joints)
+    return round(packets * (step_duration_ms + config.SETTLE_MARGIN_MS) / 1000.0 * 4.0, 1)
 
 
 def search_bounds(name: str) -> Tuple[int, int]:
