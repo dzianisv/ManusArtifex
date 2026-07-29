@@ -118,8 +118,33 @@ procedure:
 - it writes a separate timestamped result file and **never** edits
   `config.json` — promotion is a deliberate, separately-validated second step.
 
+**How far it is allowed to look.** The search probes out to
+`config.absolute_bounds(name)` — ring 1, `(700, 2300)` for every joint except
+GRIP's `(1500, 2300)` — and not merely the provisional band. It has to: the
+provisional band exists *because* the true stops are unknown and assumed to lie
+outside it, so a search confined to that band could never find a real stop and
+would write placeholders that look like measurements. (It did exactly that, once;
+see the schema bump to `robohand-calibration-v2`.)
+
+It reaches ring 1 through one narrowly-scoped capability,
+`SafetyLayer.move(..., probe_absolute_bounds=True)`, which still requires
+`allow_uncalibrated_override=True` plus a non-empty `override_reason`, logs
+through the same `override_log` and WARNING path as every other override, and
+does **not** touch the unconditional `OutOfGlobalGuard` backstop. It defaults to
+off, is not reachable from `robohand move` or any other CLI subcommand, and
+`robohand/calibrate.py` is the only file in the package that passes it — a test
+asserts that structurally.
+
+Its two findings are `bounded_by_mechanical_stop` (a stop was observed — a
+measurement) and `bounded_by_policy_limit` (the search ran out of range **we are
+willing to command** — not a measurement, and specifically *not* a claim about
+the servo's electrical rating, which is wider than ring 1 almost everywhere).
+
 Treat its output as a first draft to sanity-check by hand before promoting.
-[calibration.md](calibration.md) has the full, blunt list of failure modes.
+[calibration.md](calibration.md) has the full, blunt list of failure modes,
+including the permanent GRIP asymmetry: GRIP's floor of 1500 is discoverable and
+coincides with a real stop, while its true open stop at ~2500 is **permanently
+undiscoverable**, because ring 1's ceiling of 2300 is stricter than the hardware.
 
 ---
 
@@ -196,8 +221,8 @@ the *effective* bounds as the intersection of three nested rings:
    on its own** -- GRIP (servo 1) is a LeArm gripper servo whose own valid
    range is 1500..2500, not 500..2500 (see [research-hardware.md](research-hardware.md)),
    so 700 is comfortably inside the generic 700..2300 guard yet is 800 units
-   past GRIP's real floor. `config.ABSOLUTE_MIN_OVERRIDE`/`ABSOLUTE_MAX_OVERRIDE`
-   layer a stricter, per-servo, equally hardcoded rail on top of the global one
+   past GRIP's real floor. `config.ELECTRICAL_LIMITS`
+   layers a stricter, per-servo, equally hardcoded rail on top of the global one
    (`config.absolute_bounds(name)` returns the tighter of the two); GRIP's
    floor of 1500 lives there, not in JSON, and `config.py` raises at import
    time if `config.json`'s documentation-only `gripper_absolute_floor` value
@@ -220,9 +245,12 @@ gets false confidence that a command succeeded when it was actually
 redirected. `robohand move`/`grip`/`pose` on the CLI surface this as a non-zero
 exit code.
 
-Large moves are never sent as one packet: `max_step_per_move` (default 400)
-splits any move whose delta exceeds it into a ramp of smaller steps, each
-independently re-clamped through the same three rings.
+Large moves are never sent as one packet: `max_step_per_move` (currently 300 in
+`config.json`) splits any move whose delta exceeds it into a ramp of smaller
+steps, each independently re-clamped through the same three rings.
+`SafetyLayer.plan_ramp()` is the single source of truth for that split, so a
+caller that needs to account for the real commanded time (the calibration
+routine's torque budget does) can ask for the packet count instead of guessing.
 
 **The choke point.** `SafetyLayer.move()` is the only method in the codebase
 allowed to produce a `MotionToken` (`protocol.MotionToken`, minted by

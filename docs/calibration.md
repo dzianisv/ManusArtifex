@@ -72,11 +72,38 @@ everything awkward about this design follows from that substitution.
 6. Record `limit = last_confirmed_moving_position -/+ margin` (default margin
    60 = two steps), retreat there, and unload.
 
-The searchable band comes from `config.effective_bounds(name,
-allow_uncalibrated_override=True)`, intersected with
-`config.absolute_bounds(name)`. The search **cannot** leave `absolute_bounds`;
-`SafetyLayer` would refuse the move regardless, and the routine clamps before
-it asks.
+### Where the search is allowed to look
+
+`calibrate.search_bounds(name)` returns **`config.absolute_bounds(name)`** —
+`(700, 2300)` for every joint except GRIP, which is `(1500, 2300)`. That is the
+hardcoded `GLOBAL_GUARD_MIN`/`GLOBAL_GUARD_MAX` ring intersected with each
+servo's `ELECTRICAL_LIMITS`, and **`config.json` cannot widen it**.
+
+It deliberately does *not* use the configured band or
+`config.effective_bounds(..., allow_uncalibrated_override=True)`. Both of those
+are anchored to `config.JOINT_LIMITS[name].min/max`, and in the shipped
+`config.json` every uncalibrated joint's configured band is numerically
+identical to its provisional band (`centre ± 300` = `[1200, 1800]`). A search
+confined there **cannot reach a real mechanical stop on real hardware**, because
+the provisional band exists precisely to stay clear of limits nobody has
+measured. A run so confined would stop at its own fence, report that it ran out
+of room, and write `[1260, 1740]`-ish numbers that look like a measurement and
+are not one. (That was a real bug; see the `bounded_by_policy_limit` note below
+and the schema bump to `robohand-calibration-v2`.)
+
+Reaching the rail needs an explicit, narrowly-scoped capability:
+`SafetyLayer.move(..., probe_absolute_bounds=True)`. It:
+
+- still requires `allow_uncalibrated_override=True` **and** a non-empty
+  `override_reason`, and lands in the same `override_log` and the same WARNING
+  line as every other override (annotated `ABSOLUTE-RAIL PROBE`);
+- only replaces the *initial range check's* ceiling. The final, unconditional
+  `config.absolute_bounds` backstop that raises `OutOfGlobalGuard` is **not**
+  gated on it and is not weakened in any way. That backstop is what guarantees
+  GRIP can never be commanded below 1500 no matter what `calibrate.py` computes;
+- defaults to `False`, is not exposed on `robohand move` or any other CLI
+  subcommand, and `robohand/calibrate.py` is the only file in the package that
+  ever passes it. A test asserts that last property structurally.
 
 ### Two findings, not one
 
@@ -85,18 +112,36 @@ The report distinguishes them and you must not conflate them:
 | finding | meaning |
 |---|---|
 | `bounded_by_mechanical_stop` | a stop was observed, and the recorded limit sits `margin` short of it. This is a **measurement**. |
-| `bounded_by_electrical_limit` | the search ran out of legal room before finding a stop. This is **"we did not find out"** — the joint may travel further. |
+| `bounded_by_policy_limit` | the search ran out of room **we are willing to command** before finding a stop. This is **"we did not find out"** — the joint may travel further. |
 
-An `bounded_by_electrical_limit` result is not a calibration of that end. It is
-a statement that the joint's real limit is somewhere beyond the band the search
-was allowed to explore, and that a wider search (or the manual procedure) would
-be needed to find it.
+`bounded_by_policy_limit` is named for what it is. The bound it hit is
+`config.absolute_bounds()`, which for every joint except GRIP's floor is the
+`GLOBAL_GUARD_MIN`/`MAX` **policy** ring of 700/2300 — deliberately conservative,
+and *narrower* than the servo's own `ELECTRICAL_LIMITS` (500/2500 for most,
+1500/2500 for GRIP). So this finding means:
+
+> we ran out of range we are willing to command
+
+and it does **not** mean:
+
+> we hit the servo's electrical or mechanical rating
+
+Those are different claims. The finding was previously called
+`bounded_by_electrical_limit`, which invited exactly the second reading. It was
+renamed, and the calibration file schema was bumped to
+`robohand-calibration-v2` so that no file written by the older, wrong version
+can be loaded or promoted into `config.json`.
+
+(One special case: GRIP's floor of 1500 *is* simultaneously the policy floor and
+a real, confirmed mechanical/electrical stop — see `docs/research-hardware.md`.
+The label stays generic anyway, because the algorithm has no independent way to
+tell which case it is in.)
 
 ### Default constants and why
 
 | setting | default | reasoning |
 |---|---|---|
-| `step` | 30 | Between `config.GRIP_STEP` (40, the increment the grip ladder already uses in anger) and something finer. Ten steps crosses a 300-unit provisional band, so a full direction is a bounded, inspectable number of bursts, and the worst case overshoot into a stop is one step. |
+| `step` | 30 | Between `config.GRIP_STEP` (40, the increment the grip ladder already uses in anger) and something finer. The worst case overshoot into a stop is one step, i.e. 30 raw units. A full direction now sweeps up to `ceil(800/30)` = 27 steps to cross the widest centre-to-rail span — still a bounded, inspectable number of bursts. |
 | `margin` | 60 | Two steps of clearance below the last position that verifiably moved. The stop itself is somewhere in the one-step gap past that position, so the recorded limit sits roughly 2–3 steps short of the truth. Deliberately pessimistic: under-claiming travel is safe, over-claiming is not. |
 | `confirmations` | 2 | One miss is indistinguishable from a dropped frame or a shadow. Minimum enforced at 2. |
 | `step_duration_ms` | `config.MIN_DURATION_MS` (400) | See torque discipline below. |
@@ -110,12 +155,21 @@ Against the simulator, with a perfect observer, the recorded limit lands
 30–90 raw units short, on the safe side, always inside the true range.
 Representative sim runs:
 
-| joint | true stop | recorded | short by |
-|---|---|---|---|
-| GRIP | 1723 / 2131 | 1770 / 2100 | 47 / 31 |
-| ELBOW | 1287 / 1712 | 1320 / 1680 | 33 / 32 |
-| SHOULDER_PAN | 1341 / 1663 | 1380 / 1620 | 39 / 43 |
-| WRIST_FLEX | 1252 / 1749 | 1290 / 1710 | 38 / 39 |
+A full `robohand --sim calibrate --all` against `sim.DEFAULT_MECHANICAL_LIMITS`,
+at the shipped production defaults:
+
+| joint | true stop | `absolute_bounds` | recorded | short by | finding (min / max) |
+|---|---|---|---|---|---|
+| GRIP | 1500 / 2500 | 1500 / 2300 | 1560 / 2240 | 60 / **260** | policy / policy |
+| WRIST_ROLL | 900 / 2100 | 700 / 2300 | 960 / 2040 | 60 / 60 | mechanical / mechanical |
+| WRIST_FLEX | 900 / 2100 | 700 / 2300 | 960 / 2040 | 60 / 60 | mechanical / mechanical |
+| ELBOW | 850 / 2150 | 700 / 2300 | 900 / 2100 | 50 / 50 | mechanical / mechanical |
+| SHOULDER_LIFT | 850 / 2150 | 700 / 2300 | 900 / 2100 | 50 / 50 | mechanical / mechanical |
+| SHOULDER_PAN | 800 / 2200 | 700 / 2300 | 840 / 2160 | 40 / 40 | mechanical / mechanical |
+
+GRIP's max row is the odd one out and is explained under **The GRIP asymmetry**
+below. It is not a precision failure — the routine is forbidden from looking
+that far.
 
 Those numbers are the *simulator's* accuracy, against a simulator whose stops
 are exact and whose observer is noiseless. **On real hardware they are an upper
@@ -163,16 +217,132 @@ below `MIN_DURATION_MS` are **refused** rather than silently bumped, and if you
 want genuinely shorter bursts you must lower `MIN_DURATION_MS` (a safety-policy
 change, made deliberately, not a side effect of a calibration flag).
 
-Measured: a full two-direction single-joint run against the simulator accrues
-**at most 2400 ms** of stall time, and the test suite asserts that number
-directly. Derivation: per direction at most one partial step lands on the stop,
-then exactly `confirmations` (2) more push into it — 3 stalling commands, ×2
-directions, ×400 ms. Every other move in the run (the initial move to centre,
-the reliability burst, the retreat) targets a reachable position and accrues
-none. The reliability burst deliberately oscillates *inside* already-confirmed
-travel precisely so that verification costs time but not stall.
+### Stall time does not grow with the search span
+
+This is the load-bearing safety claim, and it is worth stating precisely
+because it is counter-intuitive.
+
+Widening the search from the 300-unit provisional band out to the rail
+multiplies the number of *steps* by roughly four. It does **not** multiply the
+number of *stalling* steps at all.
+
+Stall only accrues while the commanded target is past the true mechanical stop.
+The first command that overshoots pins the joint at the stop, so every later
+step in that direction is a no-motion miss, and the direction terminates after
+`confirmations` of them. Per direction the bound is therefore:
+
+```
+  1 overshoot-that-still-moved  +  confirmations (2) misses  =  3 packets
+```
+
+— a number set by `confirmations`, not by how far the search may travel. Every
+other move in the run (the initial move to centre, the re-centring between
+directions, the reliability burst, the retreat) targets a reachable position and
+accrues none. The reliability burst deliberately oscillates *inside*
+already-confirmed travel precisely so that verification costs time but not stall.
+
+A test asserts this directly: a stop 650 units from centre accrues exactly as
+much stall as one 170 units away, despite sweeping three times as many steps.
+
+```
+  per direction   3 x 400 ms  =  1,200 ms
+  per joint       x2          =  2,400 ms   <- test asserts this exactly
+  --all           x6 joints   = 14,400 ms   <- max_stall_ms default
+```
 
 Compare with the incident: unbounded, until a human intervened.
+
+### Measured run budgets
+
+All measured under `--sim` at the shipped production defaults (`step=30`,
+`step_duration_ms=400`, `margin=60`, `confirmations=2`, real
+`config.SETTLE_MARGIN_MS`) — **not** the accelerated fixture the tests use.
+
+| scenario | torque | stall | wall clock |
+|---|---|---|---|
+| one joint (ELBOW, true stops 850/2150) | 25,200 ms | 2,400 ms | 31.9 s |
+| `--all` vs `sim.DEFAULT_MECHANICAL_LIMITS` | 137,600 ms | 10,400 ms | 174.2 s |
+| `--all`, worst case¹ | 151,600 ms | 14,000 ms | 191.9 s |
+
+¹ a real stop placed as deep inside the rail as it can be on every joint and
+direction, so every probe sweep *and* every verification burst runs in full.
+
+Both the pre-fix defaults were below even a *realistic* run, because they were
+sized for a search that could only crawl over the provisional band. Current
+defaults, with their arithmetic:
+
+| budget | default | derivation |
+|---|---|---|
+| `max_stall_ms` | 14,400 | 6 joints × 2 directions × (1 + `confirmations`) × 400 ms |
+| `max_torque_ms` | 180,000 | 6 joints × (2 × (27 probe + 6 verification + 1 retreat) + 6 re-centring ramp packets) × 400 ms = 177,600, rounded |
+| `max_wall_clock_s` | 900 | the 444-packet ceiling is ~222 s of commanding at 400+100 ms/packet; ×2 leaves room for a real (slow) camera observer |
+| `max_ambiguous_observations` | 16 | a joint now makes ~64 observations rather than ~28, so the old cap of 8 would have silently halved the tolerated observer error rate |
+
+**Expected run time: about 30 s per joint, about 3 minutes for `--all`**, under
+`--sim` with the instant `SimMotionObserver`. On hardware, add the real camera's
+per-observation latency (~440 observations for `--all`) — budget 5–10 minutes and
+watch the whole thing.
+
+### A note on the re-centring move
+
+Between the two search directions the routine returns the joint to centre. That
+move can now span up to 800 units, and `SafetyLayer` ramps anything over
+`max_step_per_move` (300) into several back-to-back packets with no unload
+between them. This is the one place in the run where torque stays on across more
+than one packet.
+
+It is bounded and it is not a probe: the path is exclusively through territory
+the joint has *already been watched* to traverse, moving *away* from the stop,
+and `config.MAX_CONTINUOUS_TORQUE_MS` (8,000) bounds it independently. The
+torque budget accounts for it exactly — `_torque_burst` charges
+`packets × per_packet_duration` as computed by `SafetyLayer.plan_ramp`, not one
+nominal step duration, and a test asserts `budget.torque_ms` equals the summed
+duration of every MOVE packet in the transport log.
+
+### Is 400 ms per burst actually safe? An honest answer
+
+**We are keeping `step_duration_ms` at 400 ms**, and here is the unvarnished
+reasoning.
+
+Before the `search_bounds` fix, this routine could never actually reach a real
+mechanical stop — so the torque-burst-then-unload discipline, although correctly
+implemented, was never once exercised against a genuine stall. After the fix it
+will be, on every joint and every direction that has a stop inside the rail, by
+design. That is the entire point of the change, and it means the burst duration
+now matters in a way it previously did not.
+
+What the hardware data supports (`docs/research-hardware.md`): the LDX-218 is
+rated 17 kg·cm at 7.4 V with a minimum working current of 1 A; the LFD-06's
+closest documented relative, the LFD-01M, quotes a locked-rotor current of
+≤1.1 A and claims a "built-in anti-blocking algorithm". That is thin. It gives
+no stall-duration derating curve, no thermal time constant, and no independent
+confirmation that the anti-blocking claim is real or that it applies to the
+LFD-06 we actually have.
+
+So: **we cannot fully validate burst-duration safety without hardware.** What we
+can do, and have done, is bound the worst case — 400 ms per stalling packet,
+at most 3 stalling packets per joint per direction (a bound set by
+`confirmations`, not by the search span), 2,400 ms per joint and 14,400 ms
+across a full `--all`, with an unload between every single one. Anyone who tells
+you more than that from the datasheets we have is guessing.
+
+Why not shorten it? `config.MIN_DURATION_MS` is 400 and `SafetyLayer.move()`
+silently raises anything shorter to it, so 400 ms is the practical floor without
+changing `MIN_DURATION_MS` — a global safety-policy change affecting every
+caller in the package, far outside the blast radius of this fix. Shipping a
+smaller number here would be a lie in the config file: the hardware would still
+see 400.
+
+Why not lengthen it, or reduce `confirmations` to save steps? Neither helps.
+`confirmations` stays at its enforced minimum of **2** — one miss is
+indistinguishable from a dropped frame, and it is also the multiplier on total
+stall exposure, so lowering it is not even available and raising it would be
+paid for directly in stall time.
+
+**The mitigation that actually carries the risk here is operator supervision.**
+`robohand calibrate` requires `--i-am-present-and-watching` on real hardware for
+exactly this reason. Run it with a hand on the power switch. The first hardware
+run of this routine is the first time these bursts have ever hit a real stop.
 
 ---
 
@@ -235,8 +405,14 @@ calibration looks like a measurement.
 A successful run writes a timestamped file — `robohand/data/calibration-<UTC
 timestamp>.json` — and **does not touch `config.json`**. Per joint it records
 the discovered min and max, the margin applied, how each end was determined
-(`bounded_by_mechanical_stop` vs `bounded_by_electrical_limit`), steps taken per
+(`bounded_by_mechanical_stop` vs `bounded_by_policy_limit`), steps taken per
 direction, ambiguous-observation count, and torque time spent.
+
+The file carries `"schema": "robohand-calibration-v2"`. `load_calibration()`
+refuses anything else, which is deliberate: `v1` files were produced by the
+version whose `search_bounds` could not reach past the provisional band, so
+their numbers are placeholders wearing a measurement's clothes. They must never
+be promotable, even by accident. Re-run the calibration instead.
 
 Promotion is a separate, explicit action:
 
@@ -277,6 +453,62 @@ The CLI enforces the first one structurally: without `--sim`, `robohand
 calibrate` refuses to run unless `--i-am-present-and-watching` is passed, and
 exits non-zero with an explanation. That flag is a statement of fact by the
 operator, not a formality.
+
+---
+
+## The GRIP asymmetry — a known, permanent limitation
+
+GRIP is the one joint where the two ends behave differently, and neither
+behaviour is a bug to be fixed later. Both are consequences of where our own
+policy ring sits relative to GRIP's real travel.
+
+```
+        1500        1560              2240   2300      2500
+         |           |                  |     |          |
+   ------+===========+==================+=====+~~~~~~~~~~+------
+         ^           ^                  ^     ^          ^
+   policy floor  recorded min     recorded max |    TRUE open stop
+   == TRUE                                policy ceiling
+   closed stop                            (stricter than the hardware)
+
+   ===  searchable          ~~~  real travel we refuse to command
+```
+
+**The low end (1500) is discoverable, and coincides with a real stop.**
+`absolute_bounds("GRIP")[0]` is 1500 because `ELECTRICAL_LIMITS[1]` is
+`(1500, 2500)` — and per `docs/research-hardware.md` 1500 is also the confirmed
+true mechanical closed stop. So the search sweeps down, commands 1500, the joint
+visibly moves to it, and the direction terminates on "reached the bound while
+still moving". It reports `bounded_by_policy_limit` at `1500 + margin` = **1560**.
+
+Note what *does not* happen: the routine never observes a no-motion event at
+this end, because it runs out of legal room on the very command that lands on
+the stop. So the finding is `bounded_by_policy_limit`, not
+`bounded_by_mechanical_stop` — which is the honest answer. The algorithm has no
+way to know that the policy floor and the mechanical floor happen to be the same
+number here; it only knows it ran out of room. Zero stall time accrues.
+
+If a particular arm's real closed stop sits *above* 1500 — say at 1610 — that
+one **is** discoverable and is correctly reported as
+`bounded_by_mechanical_stop`. (Before the `search_bounds` fix it was not: the
+old search floor was 1600.)
+
+**The high end (2500) is NOT discoverable, permanently.** GRIP's true open stop
+is at 2500, but `GLOBAL_GUARD_MAX` is 2300, so `absolute_bounds("GRIP")[1]` is
+2300 — **our policy ceiling is stricter than the hardware**. The search reaches
+2300, reports `bounded_by_policy_limit`, and records `2300 - margin` = **2240**.
+It cannot go further and it should not: we refuse to command GRIP that high
+regardless of what the servo could physically do.
+
+This is intentional and permanent. It means the recorded GRIP maximum is
+~260 units short of the truth, and that shortfall is a *policy* decision, not a
+measurement error. Do not "fix" it by widening `GLOBAL_GUARD_MAX`; that guard is
+the outermost ring in the whole safety design and the 2026-07-28 gripper
+incident is the reason it exists.
+
+The practical consequence: **GRIP's open end will never be calibrated by this
+routine.** If you need the true 2500 figure, it must come from the manual
+procedure, recorded deliberately, with the guard consequences understood.
 
 ---
 
