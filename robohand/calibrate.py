@@ -10,6 +10,17 @@ find them is a human moving each joint by hand with torque off. This module adds
 *semi-automated* alternative: command a small increment, ask a ``MotionObserver``
 whether the arm visibly moved, and treat repeated no-motion as a candidate stop.
 
+Where it is allowed to look
+---------------------------
+Out to ``config.absolute_bounds(name)`` -- 700..2300 for most joints, 1500..2300
+for GRIP -- and no further. NOT the provisional/configured band: on a genuinely
+uncalibrated arm the true stops are, by definition, somewhere in the wide unknown
+territory the provisional band was built to stay clear of, so a search confined to
+that band cannot find them and would only ever rediscover its own ceiling. See
+``search_bounds``. Reaching that range needs ``SafetyLayer``'s audited
+``probe_absolute_bounds`` capability; ``SafetyLayer``'s unconditional
+absolute-rail backstop still applies to every single packet.
+
 What makes this different from the 2026-07-28 incident
 ------------------------------------------------------
 The incident was a single absolute command into a mechanical stop with torque left
@@ -50,13 +61,26 @@ from .safety import SafetyViolation
 
 logger = logging.getLogger("robohand.calibrate")
 
-SCHEMA = "robohand-calibration-v1"
+SCHEMA = "robohand-calibration-v2"
 
-#: How the search ended on one side of one joint. These are deliberately distinct:
-#: a mechanical stop is a *measurement*, an electrical limit is "we ran out of
-#: legal room to look and never found one", which is not the same claim at all.
+#: How the search ended on one side of one joint. These are deliberately distinct,
+#: and the second one is deliberately NOT called an "electrical" limit:
+#:
+#: ``config.absolute_bounds()`` is ``GLOBAL_GUARD_MIN/MAX`` (700/2300) -- a
+#: conservative *policy* ring chosen by this package -- intersected with the
+#: servo's own ``ELECTRICAL_LIMITS`` (500..2500 for most joints, 1500..2500 for
+#: GRIP), which is wider on every end except one. So reaching that bound without
+#: ever observing a stop means "we ran out of range we are willing to command",
+#: NOT "we hit the servo's electrical or mechanical rating". Those are different
+#: claims and this finding must never be read as the latter.
+#:
+#: The one exception is GRIP's floor, where the policy number and the confirmed
+#: true stop coincide at exactly 1500 (see docs/research-hardware.md). The label
+#: stays generic anyway: the algorithm has no independent way to know which case
+#: it is in, and a finding that quietly means two different things is worse than
+#: one that means less.
 FINDING_MECHANICAL_STOP = "bounded_by_mechanical_stop"
-FINDING_ELECTRICAL_LIMIT = "bounded_by_electrical_limit"
+FINDING_POLICY_LIMIT = "bounded_by_policy_limit"
 
 #: Hard ceiling on a single step's torque burst. The design requirement is "well
 #: under half a second of torque per step"; anything at or above this is refused
@@ -100,8 +124,8 @@ class CalibrationSettings:
 
     #: Raw units per probe step. 30 sits between the grip ladder's 40
     #: (``config.GRIP_STEP``) and something finer: it resolves a limit to ~1 step
-    #: while keeping a sweep of one full provisional band (``PROVISIONAL_BAND`` =
-    #: 300) to 10 steps per direction, so a two-direction joint run is ~20 bursts.
+    #: while keeping the longest possible sweep -- centre (1500) to a rail (700 or
+    #: 2300) for a non-GRIP joint, i.e. 800 units -- to 27 steps per direction.
     step: int = 30
 
     #: Torque per step. ``SafetyLayer.move`` floors every duration at
@@ -205,7 +229,7 @@ class DirectionResult:
 
     direction: str  # "min" or "max"
     limit: int
-    finding: str  # FINDING_MECHANICAL_STOP | FINDING_ELECTRICAL_LIMIT
+    finding: str  # FINDING_MECHANICAL_STOP | FINDING_POLICY_LIMIT
     margin: int
     steps: int
     ambiguous_observations: int
@@ -333,16 +357,37 @@ class _Budget:
 def search_bounds(name: str) -> Tuple[int, int]:
     """The widest range this routine is ever allowed to probe for ``name``.
 
-    The joint's configured min/max with the uncalibrated-override applied,
-    intersected (again, belt and braces) with ``config.absolute_bounds`` -- the
-    hardcoded per-servo rail that nothing in this package may widen. For GRIP this
-    evaluates to a floor of 1600, comfortably above the 1500 electrical/mechanical
-    open stop that the 2026-07-28 incident drove past.
+    ``config.absolute_bounds(name)`` and nothing narrower: the hardcoded
+    ``GLOBAL_GUARD_MIN/MAX`` ring intersected with that servo's own
+    ``ELECTRICAL_LIMITS``. Nothing in ``config.json`` can widen it, which is
+    exactly why it is the right ceiling for a supervised, torque-burst-limited,
+    vision-confirmed search.
+
+    It is deliberately NOT ``config.effective_bounds(..., override=True)``. That
+    function is always intersected with ``config.JOINT_LIMITS[name].min/max`` --
+    the configured band -- regardless of the override flag, and for every
+    uncalibrated joint in the shipped config that band is numerically identical to
+    the provisional band (both ``center +/- 300``). Searching inside it can never
+    find a real stop on an uncalibrated arm, because the provisional band exists
+    *precisely because* the true limits are assumed to lie outside it. A search
+    that can only ever hit its own ceiling produces a placeholder laundered into a
+    file that looks like a measurement.
+
+    Reaching these bounds requires ``SafetyLayer.move(probe_absolute_bounds=True)``
+    (see ``_torque_burst``), which is audited and still sits behind
+    ``SafetyLayer``'s unconditional absolute-rail backstop.
     """
     key = config.validate_joint_name(name)
-    lo, hi = config.effective_bounds(key, allow_uncalibrated_override=True)
+    lo, hi = config.absolute_bounds(key)
+    # Belt and braces: a no-op by construction today, and an assertion that stays
+    # true if absolute_bounds ever changes shape.
     abs_lo, abs_hi = config.absolute_bounds(key)
-    return max(lo, abs_lo), min(hi, abs_hi)
+    lo, hi = max(lo, abs_lo), min(hi, abs_hi)
+    assert (abs_lo, abs_hi) == (lo, hi), (
+        f"{key}: search bounds [{lo}, {hi}] must never exceed the absolute rail "
+        f"[{abs_lo}, {abs_hi}]"
+    )
+    return lo, hi
 
 
 def _start_position(name: str, lo: int, hi: int) -> int:
@@ -358,6 +403,13 @@ def _torque_burst(arm, name: str, target: int, settings: CalibrationSettings, bu
     motion" is the *expected* successful outcome of the last step in a direction,
     not an anomaly to raise ``StallDetected`` for. This routine does its own,
     graceful no-motion handling immediately below the call site.
+
+    ``probe_absolute_bounds=True`` is what makes the widened ``search_bounds``
+    actually reachable: without it ``SafetyLayer`` would check this target against
+    ``config.effective_bounds`` (the configured band) and refuse anything outside
+    it, even with the override applied. It is still audited, still requires the
+    override + reason below, and is still subject to ``SafetyLayer``'s
+    unconditional absolute-rail backstop.
     """
     arm.set_position(
         name,
@@ -366,6 +418,7 @@ def _torque_burst(arm, name: str, target: int, settings: CalibrationSettings, bu
         wait=True,
         vision_guard=None,
         allow_uncalibrated_override=True,
+        probe_absolute_bounds=True,
         override_reason=f"auto-calibration probe for {name} (bounded {settings.step_duration_ms}ms burst)",
     )
     # Unload through SafetyLayer *before* observing -- bounded exposure per step is
@@ -406,8 +459,10 @@ def _search_direction(
 
     ``sign`` is -1 (searching for the minimum) or +1 (the maximum). The two possible
     endings are reported differently on purpose: ``FINDING_MECHANICAL_STOP`` is a
-    measurement ("it stopped moving here"), ``FINDING_ELECTRICAL_LIMIT`` is an
-    admission ("we ran out of legal room to look and never found a stop").
+    measurement ("it stopped moving here"), ``FINDING_POLICY_LIMIT`` is an
+    admission ("we ran out of range we are willing to command and never found a
+    stop"). The latter is emphatically not a claim about the servo's electrical or
+    mechanical rating -- see the constants' comment at the top of this module.
     """
     lo, hi = search_bounds(name)
     bound = lo if sign < 0 else hi
@@ -523,7 +578,7 @@ def _search_direction(
                 )
             return _result(
                 _apply_margin(name, bound, -sign * settings.margin, lo, hi),
-                FINDING_ELECTRICAL_LIMIT,
+                FINDING_POLICY_LIMIT,
             )
 
         before = _capture(observer, f"{name} before step -> {next_pos}")
@@ -548,7 +603,7 @@ def _search_direction(
                 # Still moving when we ran out of legal room: no stop was found.
                 return _result(
                     _apply_margin(name, bound, -sign * settings.margin, lo, hi),
-                    FINDING_ELECTRICAL_LIMIT,
+                    FINDING_POLICY_LIMIT,
                 )
             continue
 

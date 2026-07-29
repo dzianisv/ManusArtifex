@@ -265,6 +265,16 @@ def test_probe_absolute_bounds_defaults_off_everywhere_and_is_not_on_the_cli():
     move_source = inspect.getsource(cli.cmd_move)
     assert "probe" not in move_source
 
+    # And the only module in the package that sets it is calibrate.py.
+    import pathlib
+
+    package_dir = pathlib.Path(cli.__file__).parent
+    setters = sorted(
+        p.name for p in package_dir.glob("*.py")
+        if "probe_absolute_bounds=True" in p.read_text()
+    )
+    assert setters == ["calibrate.py"], setters
+
 
 def test_uncalibrated_override_semantics_are_unchanged_without_the_flag():
     """Regression fence around the existing ``robohand move --override-reason`` path."""
@@ -336,11 +346,18 @@ def test_discovered_band_is_inside_true_mechanical_limits(joint, servo_id, true_
     assert result.max_finding == calibration.FINDING_MECHANICAL_STOP
 
 
-def test_stop_outside_the_searchable_band_is_reported_as_electrical_not_mechanical(fast):
-    """A joint whose mechanical stops are wider than the band we are allowed to
-    probe must report ``bounded_by_electrical_limit`` -- "we ran out of legal room"
-    is a different claim from "we found the stop", and conflating them would let a
-    later reader believe a limit was measured when it never was.
+def test_stop_outside_the_searchable_band_is_reported_as_policy_not_mechanical(fast):
+    """A joint whose mechanical stops are wider than the range we are *willing to
+    command* must report ``bounded_by_policy_limit`` -- "we ran out of range we are
+    willing to command" is a different claim from "we found the stop", and
+    conflating them would let a later reader believe a limit was measured when it
+    never was.
+
+    Note what the label does NOT say. ELBOW's electrical range is 500..2500; the
+    700/2300 bound this run stops at is our own ``GLOBAL_GUARD_MIN/MAX`` policy
+    ring, well inside the hardware's rating. Calling this an "electrical limit"
+    (as an earlier version did) would have been a claim about the servo that this
+    routine has no evidence for.
     """
     with make_arm({4: (500, 2500)}) as arm:
         run = calibration.calibrate(
@@ -348,15 +365,51 @@ def test_stop_outside_the_searchable_band_is_reported_as_electrical_not_mechanic
         )
     result = run.joints["ELBOW"]
     lo, hi = calibration.search_bounds("ELBOW")
-    assert result.min_finding == calibration.FINDING_ELECTRICAL_LIMIT
-    assert result.max_finding == calibration.FINDING_ELECTRICAL_LIMIT
+    assert (lo, hi) == (700, 2300)
+    assert config.electrical_bounds("ELBOW") == (500, 2500), (
+        "the policy bound this run stopped at is strictly inside the servo's own "
+        "electrical rating -- which is exactly why the finding must not say 'electrical'"
+    )
+    assert result.min_finding == calibration.FINDING_POLICY_LIMIT
+    assert result.max_finding == calibration.FINDING_POLICY_LIMIT
     assert result.min == lo + fast.margin
     assert result.max == hi - fast.margin
 
 
+def test_finding_names_never_claim_an_electrical_measurement():
+    assert calibration.FINDING_POLICY_LIMIT == "bounded_by_policy_limit"
+    assert "electrical" not in calibration.FINDING_POLICY_LIMIT
+    assert "electrical" not in calibration.FINDING_MECHANICAL_STOP
+    assert not hasattr(calibration, "FINDING_ELECTRICAL_LIMIT")
+
+
+def test_calibration_schema_is_v2_and_v1_files_are_refused(tmp_path):
+    """A file produced by the pre-fix version recorded a band ~360 units narrower
+    than reality on each side and labelled it a measurement. It must never be
+    promotable, so the schema string changed and the existing mismatch check
+    refuses the old one.
+    """
+    assert calibration.SCHEMA == "robohand-calibration-v2"
+    stale = tmp_path / "calibration-v1.json"
+    stale.write_text(json.dumps({
+        "schema": "robohand-calibration-v1",
+        "transport": "hardware",
+        "joints": {"ELBOW": {"min": 1260, "max": 1740}},
+    }))
+    with pytest.raises(calibration.CalibrationRefused, match="unknown calibration schema"):
+        calibration.load_calibration(stale)
+    config_copy = tmp_path / "config.json"
+    original = config.load_config(config.DEFAULT_CONFIG_PATH)
+    config_copy.write_text(json.dumps(original, indent=2))
+    with pytest.raises(calibration.CalibrationRefused, match="unknown calibration schema"):
+        calibration.apply_calibration(stale, config_path=config_copy)
+    assert json.loads(config_copy.read_text()) == original
+
+
 def test_grip_search_never_approaches_the_incident_value(fast):
-    """GRIP's downward search is floored at 1600 by config, 100 clear of the 1500
-    open stop and 900 clear of the 700 the incident commanded.
+    """GRIP's downward search is floored at 1500 -- its own electrical floor, and
+    the confirmed true open stop -- which is 800 units clear of the 700 the
+    incident commanded. That value is not expressible by this routine.
     """
     with make_arm({GRIP_SERVO_ID: (1520, 2480)}) as arm:
         run = calibration.calibrate(
@@ -364,9 +417,12 @@ def test_grip_search_never_approaches_the_incident_value(fast):
         )
         targets = grip_targets(arm._transport)
         assert_no_grip_command_below_floor(arm._transport)
-    assert min(targets) >= 1600
-    assert run.joints["GRIP"].min >= 1600
-    assert run.joints["GRIP"].min_finding == calibration.FINDING_ELECTRICAL_LIMIT
+    assert min(targets) >= 1500
+    assert run.joints["GRIP"].min >= 1500
+    # The true stop here (1520) is one step inside the rail, so the last commanded
+    # position (1500) still produced visible motion and no stop was ever observed:
+    # honest answer is "ran out of legal room", not "measured a stop".
+    assert run.joints["GRIP"].min_finding == calibration.FINDING_POLICY_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -600,7 +656,12 @@ def test_search_bounds_never_exceed_the_absolute_rail():
         lo, hi = calibration.search_bounds(name)
         abs_lo, abs_hi = config.absolute_bounds(name)
         assert abs_lo <= lo <= hi <= abs_hi
-    assert calibration.search_bounds("GRIP")[0] >= 1500
+        # And they ARE the rail, not the configured band: the configured band is
+        # numerically identical to the provisional band for every uncalibrated
+        # joint, so searching inside it could never find a real stop.
+        assert (lo, hi) == (abs_lo, abs_hi)
+    assert calibration.search_bounds("GRIP") == (1500, 2300)
+    assert calibration.search_bounds("ELBOW") == (700, 2300)
 
 
 def test_every_commanded_target_stays_inside_the_absolute_rail(fast):
@@ -739,7 +800,7 @@ def test_result_file_records_findings_and_provenance(tmp_path, fast):
                 "steps_min", "steps_max", "ambiguous_observations", "torque_ms"):
         assert key in entry, f"result file is missing {key}"
     assert entry["min_finding"] in (
-        calibration.FINDING_MECHANICAL_STOP, calibration.FINDING_ELECTRICAL_LIMIT
+        calibration.FINDING_MECHANICAL_STOP, calibration.FINDING_POLICY_LIMIT
     )
     # config.json must be untouched by a run.
     assert config.JOINT_LIMITS["GRIP"].calibrated is False
