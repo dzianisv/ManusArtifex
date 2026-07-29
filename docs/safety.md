@@ -77,7 +77,13 @@ different from every other joint -- see the correction above and
 respective joint's mechanical end stops. `calibrated: false` is recorded per
 joint in `robohand/data/config.json`.
 
-## Calibration procedure (requires a human)
+## Calibration procedure
+
+There are two ways to do this. The manual one is the reference; the
+vision-assisted one automates the tedious part of it, badly enough that you
+should still cross-check it.
+
+### Manual (the reference method)
 
 1. Power the arm on.
 2. `python3 reset_arm.py` — torque off, joints limp.
@@ -87,9 +93,33 @@ joint in `robohand/data/config.json`.
    `calibrated: true` for that joint.
 5. Only then widen the band and re-enable motion.
 
-Note: because position read-back does not work on this controller, step 3
-currently cannot be automated. Fixing the read path (or adding an external
-camera-based joint estimate) is a prerequisite for autonomous calibration.
+### Vision-assisted (semi-automated, still needs a human present)
+
+Position read-back still does not work — `cmd 21` still never replies — so step
+3 above still cannot be automated *from the controller*. What
+[calibration.md](calibration.md) adds is the external camera-based joint
+estimate that note used to call a prerequisite: `robohand calibrate` steps a
+joint in small, individually-unloaded torque bursts and uses frame differencing
+to decide whether it actually moved. Repeated no-motion is a candidate
+mechanical stop.
+
+This is **not** autonomous calibration and it does not retire the manual
+procedure:
+
+- it requires a human physically present and watching, and refuses to run on
+  real hardware without `--i-am-present-and-watching`;
+- it under-reports travel on purpose (records a limit two-plus steps short of
+  the observed stop), so its numbers are conservative estimates, not
+  measurements;
+- it cannot tell "the gripper closed on an object" from "the gripper reached
+  its mechanical stop" — no vision-only method can;
+- it can be fooled by occlusion, lighting changes, a joint that is nearly
+  edge-on to the camera, and by a loaded joint sagging the instant it unloads;
+- it writes a separate timestamped result file and **never** edits
+  `config.json` — promotion is a deliberate, separately-validated second step.
+
+Treat its output as a first draft to sanity-check by hand before promoting.
+[calibration.md](calibration.md) has the full, blunt list of failure modes.
 
 ---
 
@@ -360,8 +390,11 @@ This does **not** prove the real servos behave identically to the simulator's
 model — GRIP's *open*-side mechanical stop (1500) is now confirmed by the
 reference firmware, but its *closed*-side stop (modeled at 2500) and every
 other joint's mechanical stop are still plausible estimates, not measured
-values (measuring them safely requires the calibration procedure above, done
-by hand with a human watching). It does not cover self-collision between
+values. Measuring them safely still requires the calibration procedure above —
+by hand with a human watching, or with the vision-assisted routine in
+[calibration.md](calibration.md), which is itself supervised, conservative, and
+proven only against the simulator. Nothing in this repository has yet measured
+a real mechanical stop. It does not cover self-collision between
 links, a rigid object being crushed with vision guard unavailable, or the arm
 falling under gravity the instant a joint unloads. See
 `docs/verification-sdk.md` for the full, blunt list of residual risk.
