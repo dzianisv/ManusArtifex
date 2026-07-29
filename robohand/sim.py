@@ -22,11 +22,18 @@ tell the difference at the call-site. Unlike the real controller it:
 Selected via ``ROBOHAND_TRANSPORT=sim`` env var or ``--sim`` CLI flag (see
 ``arm.Arm.__init__`` / ``cli.py``). The real ``HidTransport`` remains the default so
 nobody accidentally ships simulator behaviour.
+
+``SimWorld`` (bottom of this module) adds an optional *scene* on top of the
+transport -- a graspable object, a toy joints->workspace mapping, and a toy
+camera projection -- so ``robohand.pick`` can be exercised end to end. Read its
+docstring before believing anything it says about the real arm: it is a test
+fixture, not a model of this hardware.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import math
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -134,6 +141,9 @@ class SimTransport:
         self._battery_voltage = battery_voltage
         self.log: List[dict] = []
         self.closed = False
+        # Optional scene (a graspable object + toy kinematics). None by default:
+        # every existing test and every safety-layer behaviour works without it.
+        self.world: Optional["SimWorld"] = None
 
     # -- lifecycle, matches HidTransport -----------------------------------
 
@@ -176,6 +186,11 @@ class SimTransport:
         require_motion_token(self, token)
         targets = normalize_targets(id_positions)
         assert_targets_within_electrical_range(targets, duration_ms)
+        if self.world is not None:
+            # Before the joints move: decide what is physically in the way. Doing
+            # this first is what makes "the jaws closed onto an object" a real
+            # blocked command rather than a retroactive annotation.
+            self.world.before_move(targets)
         entry = {
             "cmd": "MOVE",
             "targets": list(targets),
@@ -190,6 +205,8 @@ class SimTransport:
             achieved = joint.command(target, duration_ms)
             entry["achieved"][servo_id] = achieved
         self.log.append(entry)
+        if self.world is not None:
+            self.world.after_move()
 
     def unload_servos(self, servo_ids: Sequence[int]) -> None:
         self.log.append({"cmd": "UNLOAD", "servo_ids": list(servo_ids), "ts": time.monotonic()})
@@ -197,6 +214,8 @@ class SimTransport:
             joint = self.joints.get(servo_id)
             if joint is not None:
                 joint.unload()
+        if self.world is not None:
+            self.world.after_unload(servo_ids)
 
     def get_positions(self, servo_ids: Sequence[int], timeout_ms: Optional[int] = None) -> dict:
         """Always times out -- mirrors the verified real hardware (no feedback wire)."""
@@ -219,3 +238,287 @@ class DryRunTransport(SimTransport):
     def unload_servos(self, servo_ids) -> None:
         super().unload_servos(servo_ids)
         print(f"[dry-run] MULT_SERVO_UNLOAD {list(servo_ids)}")
+
+
+# ===========================================================================
+# SimWorld -- a scene for end-to-end pick tests. TEST FIXTURE ONLY.
+# ===========================================================================
+#
+# READ THIS BEFORE USING ANY NUMBER BELOW.
+#
+# The constants and the joints->workspace mapping in this section are a TOY. They
+# are NOT a kinematic model of the LeArm, they were never measured against it, and
+# they are not even the right *shape* of model (a real arm is a chain of
+# revolute joints, i.e. trigonometric and coupled; this is three independent
+# linear axes). They exist for exactly one reason: so that ``robohand.pick``'s
+# control flow -- look, move, look again, converge or give up -- can be exercised
+# end to end with no camera, no network, and no hardware.
+#
+# ``robohand.pick`` MUST NEVER import, assume, or hardcode this mapping. It
+# discovers whatever local sensitivity it needs empirically, by nudging one joint
+# a small amount and measuring the resulting image-space displacement through the
+# locator -- the same "command a small increment, look, decide" idiom
+# ``calibrate.py`` uses. If pick.py ever needs to know these numbers, the design
+# is wrong and the routine will not survive contact with the real arm.
+#
+# The camera is equally toy: a fixed linear projection with a small height-parallax
+# term, standing in for an obliquely-mounted camera. It has no lens distortion, no
+# noise, no exposure, no latency, and no perspective divide.
+
+#: mm of workspace X per raw unit of SHOULDER_PAN.
+X_MM_PER_PAN_UNIT = 0.25
+#: mm of workspace Y (reach) per raw unit of ELBOW, plus the reach at ELBOW=1500.
+Y_MM_PER_ELBOW_UNIT = 0.20
+Y_MM_AT_ELBOW_CENTER = 120.0
+#: mm of height per raw unit of SHOULDER_LIFT, plus the height at LIFT=1500.
+Z_MM_PER_LIFT_UNIT = 0.25
+Z_MM_AT_LIFT_CENTER = 100.0
+
+#: Toy camera: pixels per mm in the table plane, image centre, and the
+#: height-parallax terms that make a raised object shift in the image (the reason
+#: a single camera cannot be trusted for the last centimetres of a grasp).
+CAM_PX_PER_MM = 3.0
+CAM_ORIGIN_PX = (320.0, 420.0)
+CAM_PARALLAX_X_PER_MM = 0.35
+CAM_PARALLAX_Y_PER_MM = 0.30
+CAM_FRAME_SHAPE = (480, 640)
+
+#: Height window (mm) in which closed jaws actually reach a table-standing object.
+DEFAULT_GRASP_Z_MIN = 25.0
+DEFAULT_GRASP_Z_MAX = 65.0
+
+
+@dataclasses.dataclass
+class SimObject:
+    """A graspable thing sitting on the simulated table.
+
+    ``x``/``y`` are table-plane millimetres in the same frame as ``SimWorld``'s
+    toy forward kinematics; ``z`` is height above the table (0 = resting on it).
+
+    ``grip_contact_position`` is the raw GRIP value at which the jaws close onto
+    this object -- i.e. how wide it is, expressed in the only unit the controller
+    understands. It becomes ``SimJoint.obstruction_max`` while the gripper is over
+    the object, which is why closing onto it registers as a ``contact_event`` and
+    never as ``stall_ms``: squeezing a held object is what a gripper is for.
+
+    ``force_slip_on_lift`` makes a slip deterministic for tests. The
+    weight-vs-capacity path (``weight_g`` > ``SimWorld.holding_capacity_g``) covers
+    the general "too heavy" case; the flag covers "reproduce the failure exactly,
+    every time, with no RNG".
+    """
+
+    x: float
+    y: float
+    z: float = 0.0
+    grasp_radius_mm: float = 12.0
+    grip_contact_position: int = 2050
+    weight_g: float = 30.0
+    force_slip_on_lift: bool = False
+    # -- state, owned by SimWorld ------------------------------------------
+    held: bool = False
+    dropped: bool = False
+    slipped: bool = False
+    grasp_count: int = 0
+    release_count: int = 0
+
+    def as_dict(self) -> Dict[str, object]:
+        return dataclasses.asdict(self)
+
+
+class SimWorld:
+    """A table, an object, a toy gripper pose, and toy grasp physics.
+
+    Attach one with :func:`attach_world`; ``SimTransport`` calls into it around
+    every move so the scene stays consistent with the joints. Everything it
+    exposes (``gripper_pose``, ``object_pixel``, ``gripper_pixel``, ``held``) is
+    **ground truth**, which is exactly what makes it useful for verifying a pick
+    independently of what the routine itself believes happened.
+
+    What is modelled:
+
+    * where the gripper is, from three joints, via the toy mapping above;
+    * whether the jaws are over the object and low enough to reach it;
+    * closing onto the object as a rigid obstruction on servo 1 (reusing
+      ``SimJoint.obstruction_max`` -- there is deliberately no second,
+      parallel contact system);
+    * closing onto empty air, which reaches the ladder's own backstop with no
+      contact at all, so "the grasp missed" is genuinely representable;
+    * a held object moving rigidly with the gripper;
+    * slipping during a lift, either because it is too heavy or because a test
+      demanded it.
+
+    What is NOT modelled, and would matter on the real arm: gravity/torque
+    coupling, arm compliance, backlash, jaw friction and squeeze force, the
+    object toppling or rolling, collisions with anything other than the object,
+    and the entire real relationship between commanded PWM value and geometry.
+    """
+
+    def __init__(
+        self,
+        transport: "SimTransport",
+        obj: Optional[SimObject] = None,
+        *,
+        holding_capacity_g: float = 80.0,
+        grasp_z_min: float = DEFAULT_GRASP_Z_MIN,
+        grasp_z_max: float = DEFAULT_GRASP_Z_MAX,
+        frame_shape: Tuple[int, int] = CAM_FRAME_SHAPE,
+    ) -> None:
+        self.transport = transport
+        self.object = obj
+        self.holding_capacity_g = float(holding_capacity_g)
+        self.grasp_z_min = float(grasp_z_min)
+        self.grasp_z_max = float(grasp_z_max)
+        self.frame_shape = tuple(frame_shape)
+        self._grasp_offset: Optional[Tuple[float, float, float]] = None
+        #: Diagnostic trail for tests: every state transition the scene made.
+        self.events: List[dict] = []
+
+    # -- toy forward kinematics (TEST FIXTURE ONLY, see module note) --------
+
+    def _joint(self, servo_id: int) -> int:
+        return self.transport.joints[servo_id].position
+
+    def gripper_pose(self, overrides: Optional[Dict[int, int]] = None) -> Tuple[float, float, float]:
+        """Toy gripper (x, y, z) in mm from SHOULDER_PAN / ELBOW / SHOULDER_LIFT.
+
+        ``overrides`` lets ``before_move`` ask "where will the gripper be when
+        this packet lands", which is what makes obstruction placement causal
+        rather than one packet late.
+        """
+        overrides = overrides or {}
+        pan = overrides.get(6, self._joint(6))
+        elbow = overrides.get(4, self._joint(4))
+        lift = overrides.get(5, self._joint(5))
+        x = (pan - 1500) * X_MM_PER_PAN_UNIT
+        y = Y_MM_AT_ELBOW_CENTER + (elbow - 1500) * Y_MM_PER_ELBOW_UNIT
+        z = Z_MM_AT_LIFT_CENTER + (lift - 1500) * Z_MM_PER_LIFT_UNIT
+        return x, y, z
+
+    # -- toy camera --------------------------------------------------------
+
+    def project(self, x: float, y: float, z: float) -> Tuple[float, float]:
+        """Toy oblique-camera projection of a workspace point to pixels."""
+        cx, cy = CAM_ORIGIN_PX
+        px = cx + x * CAM_PX_PER_MM + z * CAM_PARALLAX_X_PER_MM
+        py = cy - (y - 60.0) * CAM_PX_PER_MM - z * CAM_PARALLAX_Y_PER_MM
+        return px, py
+
+    def gripper_pixel(self) -> Tuple[float, float]:
+        return self.project(*self.gripper_pose())
+
+    def object_pixel(self) -> Optional[Tuple[float, float]]:
+        if self.object is None:
+            return None
+        return self.project(self.object.x, self.object.y, self.object.z)
+
+    # -- queries used by tests and by locate.SimLocator --------------------
+
+    @property
+    def held(self) -> bool:
+        return bool(self.object is not None and self.object.held)
+
+    def object_position(self) -> Optional[Tuple[float, float, float]]:
+        if self.object is None:
+            return None
+        return self.object.x, self.object.y, self.object.z
+
+    def distance_to_object(self, overrides: Optional[Dict[int, int]] = None) -> Optional[float]:
+        """Planar mm between the gripper and the object; None if there is no object."""
+        if self.object is None:
+            return None
+        gx, gy, _gz = self.gripper_pose(overrides)
+        return math.hypot(gx - self.object.x, gy - self.object.y)
+
+    def can_grasp(self, overrides: Optional[Dict[int, int]] = None) -> bool:
+        """True when the jaws are over the object AND low enough to reach it."""
+        if self.object is None:
+            return False
+        gx, gy, gz = self.gripper_pose(overrides)
+        planar = math.hypot(gx - self.object.x, gy - self.object.y)
+        return planar <= self.object.grasp_radius_mm and self.grasp_z_min <= gz <= self.grasp_z_max
+
+    # -- transport hooks ---------------------------------------------------
+
+    def before_move(self, targets: Sequence[Tuple[int, int]]) -> None:
+        """Place/remove the GRIP obstruction for the pose this packet will produce."""
+        if self.object is None:
+            return
+        overrides = {servo_id: pos for servo_id, pos in targets}
+        grip = self.transport.joints.get(1)
+        if grip is None:
+            return
+        if self.object.held or self.can_grasp(overrides):
+            grip.obstruction_max = int(self.object.grip_contact_position)
+        else:
+            grip.obstruction_max = None
+
+    def after_move(self) -> None:
+        """Update grasp/hold/slip state from the pose the joints actually reached."""
+        if self.object is None:
+            return
+        grip = self.transport.joints.get(1)
+        gx, gy, gz = self.gripper_pose()
+        squeezing = bool(
+            grip is not None
+            and grip.torque_on
+            and grip.position >= self.object.grip_contact_position
+        )
+
+        if not self.object.held:
+            if squeezing and self.can_grasp():
+                self.object.held = True
+                self.object.dropped = False
+                self.object.slipped = False
+                self.object.grasp_count += 1
+                self._grasp_offset = (
+                    self.object.x - gx,
+                    self.object.y - gy,
+                    self.object.z - gz,
+                )
+                self.events.append({"event": "grasped", "gripper": (gx, gy, gz)})
+            return
+
+        # Held: the object rides with the gripper, keeping the offset it had at
+        # the moment of the grasp.
+        if not squeezing:
+            self._release("jaws_opened", gx, gy, gz)
+            return
+
+        ox, oy, oz = self._grasp_offset or (0.0, 0.0, 0.0)
+        self.object.x, self.object.y, self.object.z = gx + ox, gy + oy, gz + oz
+
+        lifting = gz > self.grasp_z_max
+        if lifting and (self.object.force_slip_on_lift or self.object.weight_g > self.holding_capacity_g):
+            self.object.slipped = True
+            self._release("slipped_during_lift", gx, gy, gz)
+
+    def after_unload(self, servo_ids: Sequence[int]) -> None:
+        if self.object is None or not self.object.held:
+            return
+        if 1 in servo_ids:
+            gx, gy, gz = self.gripper_pose()
+            self._release("grip_unloaded", gx, gy, gz)
+
+    def _release(self, reason: str, gx: float, gy: float, gz: float) -> None:
+        self.object.held = False
+        self.object.release_count += 1
+        # Whatever it was doing, it is now on the table wherever it was let go.
+        # "dropped" means it came out involuntarily; a deliberate open-and-place
+        # is a release, not a drop.
+        self.object.z = 0.0
+        self.object.dropped = bool(self.object.slipped)
+        self._grasp_offset = None
+        self.events.append({"event": "released", "reason": reason, "gripper": (gx, gy, gz)})
+
+    def describe(self) -> str:
+        return (
+            f"SimWorld(object={None if self.object is None else (round(self.object.x, 1), round(self.object.y, 1))}, "
+            f"held={self.held}, TOY KINEMATICS -- test fixture only)"
+        )
+
+
+def attach_world(transport: "SimTransport", obj: Optional[SimObject] = None, **kwargs) -> SimWorld:
+    """Attach a :class:`SimWorld` scene to a ``SimTransport`` and return it."""
+    world = SimWorld(transport, obj, **kwargs)
+    transport.world = world
+    return world
