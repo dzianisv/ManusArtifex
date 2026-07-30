@@ -389,6 +389,134 @@ def test_cli_doctor_degrades_gracefully_without_a_camera(monkeypatch, capsys):
     assert payload["safety_layers"]["layer3_vision_guard"] is False
 
 
+class _CountingObserver(_ScoreStub):
+    """Like ``_ScoreStub`` but counts ``capture()`` calls, so a test can assert
+    exactly how many frames a caller sampled without needing a real camera."""
+
+    def __init__(self, value: float, threshold: float = 1.0) -> None:
+        super().__init__(value, threshold=threshold)
+        self.capture_calls = 0
+
+    def capture(self):
+        self.capture_calls += 1
+        return self.capture_calls
+
+
+def _spy_on_camera_health_report(monkeypatch, sleep):
+    """Wrap the real ``cli._camera_health_report`` to record every ``(frames,
+    interval_s)`` it is called with and to inject ``sleep`` in place of
+    ``time.sleep`` -- this exercises the exact same shared sampling/verdict code
+    doctor and camera-check use in production, just without real wall-clock
+    delay, and without touching any production code path (the ``sleep`` kwarg
+    already exists on ``_camera_health_report`` for this purpose)."""
+    from robohand import cli
+
+    real = cli._camera_health_report
+    calls = []
+
+    def spy(frames, interval_s, **kwargs):
+        calls.append((frames, interval_s))
+        return real(frames, interval_s, sleep=sleep, **kwargs)
+
+    monkeypatch.setattr(cli, "_camera_health_report", spy)
+    return calls
+
+
+def test_doctor_and_camera_check_sample_the_same_calibrated_frames_and_interval(monkeypatch):
+    """Doctor must sample with the SAME ``config.VISION_HEALTH_FRAMES`` /
+    ``config.VISION_HEALTH_INTERVAL_S`` that ``camera-check`` uses -- there must be
+    no second, faster, independently-hardcoded pair of sampling numbers anywhere in
+    the CLI. Proven two ways for BOTH commands: (1) the shared ``_camera_health_report``
+    helper is invoked with exactly ``(config.VISION_HEALTH_FRAMES,
+    config.VISION_HEALTH_INTERVAL_S)`` and nothing else, and (2) the observer's
+    ``capture()`` is invoked exactly ``VISION_HEALTH_FRAMES`` times while ``sleep()``
+    is invoked exactly ``VISION_HEALTH_FRAMES - 1`` times, each with
+    ``VISION_HEALTH_INTERVAL_S``. This is the strongest check against someone
+    re-hardcoding a faster doctor-only sample (e.g. 5 frames / 0.1s): it fails the
+    instant the args or call counts diverge from camera-check's.
+    """
+    from robohand import cli
+
+    sleep_calls = []
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    observer = _CountingObserver(0.0, threshold=1.0)
+    _patch_camera(monkeypatch, observer)
+    call_args = _spy_on_camera_health_report(monkeypatch, fake_sleep)
+
+    rc = cli.main(["--sim", "doctor", "--json"])
+    assert rc == 0
+    assert call_args == [(config.VISION_HEALTH_FRAMES, config.VISION_HEALTH_INTERVAL_S)]
+    assert observer.capture_calls == config.VISION_HEALTH_FRAMES
+    assert sleep_calls == [config.VISION_HEALTH_INTERVAL_S] * (config.VISION_HEALTH_FRAMES - 1)
+
+    # Reset counters and repeat for camera-check -- must match doctor exactly.
+    observer.capture_calls = 0
+    call_args.clear()
+    sleep_calls.clear()
+    rc = cli.main(["camera-check", "--json"])
+    assert rc == 0
+    assert call_args == [(config.VISION_HEALTH_FRAMES, config.VISION_HEALTH_INTERVAL_S)]
+    assert observer.capture_calls == config.VISION_HEALTH_FRAMES
+    assert sleep_calls == [config.VISION_HEALTH_INTERVAL_S] * (config.VISION_HEALTH_FRAMES - 1)
+
+
+def test_cli_doctor_quick_camera_never_renders_a_fail_verdict(monkeypatch, capsys):
+    """The ``--quick-camera`` escape hatch samples too fast to span an
+    auto-exposure hunt cycle, so it must NEVER emit a FAIL/unhealthy verdict --
+    even when fed a synthetic noise floor that would normally FAIL loudly. It must
+    degrade to an explicit "not measured"/inconclusive report instead, in both
+    human and --json output."""
+    from robohand import cli
+
+    _patch_camera(monkeypatch, NoisyMotionObserver(noise_floor=300_000, threshold=150))
+
+    rc = cli.main(["--sim", "doctor", "--quick-camera"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "FAIL" not in out
+    assert "camera present but its no-motion noise floor swamps" not in out
+    assert "not measured" in out
+
+    rc = cli.main(["--sim", "doctor", "--quick-camera", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    ch = payload["camera_health"]
+    assert ch["conclusive"] is False
+    assert ch["healthy"] is True
+    assert "not measured" in ch["inconclusive_reason"]
+    assert ch["frames"] == cli.QUICK_CAMERA_FRAMES
+    assert ch["interval_s"] == cli.QUICK_CAMERA_INTERVAL_S
+
+
+def test_cli_doctor_default_still_reports_honest_unhealthy_verdict(monkeypatch, capsys):
+    """Regression: quick-mode's "never FAIL" carve-out must not leak into the
+    default (non-quick) path. A genuinely noisy camera must still produce an
+    honest, conclusive, unhealthy verdict from plain 'doctor' -- exactly like
+    camera-check would report for the same camera."""
+    from robohand import cli
+
+    _spy_on_camera_health_report(monkeypatch, sleep=lambda s: None)
+    _patch_camera(monkeypatch, NoisyMotionObserver(noise_floor=300_000, threshold=150))
+
+    rc = cli.main(["--sim", "doctor", "--json"])
+    assert rc == 0  # doctor never fails the *process* over an unhealthy camera
+    payload = json.loads(capsys.readouterr().out)
+    ch = payload["camera_health"]
+    assert ch["conclusive"] is True
+    assert ch["healthy"] is False
+    assert ch["frames"] == config.VISION_HEALTH_FRAMES
+    assert ch["interval_s"] == config.VISION_HEALTH_INTERVAL_S
+
+    rc = cli.main(["--sim", "doctor"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Camera health: FAIL" in out
+    assert "camera present but its no-motion noise floor swamps" in out
+
+
 # ---------------------------------------------------------------------------
 # 5. headroom / measured-separation ratios (report fields)
 # ---------------------------------------------------------------------------

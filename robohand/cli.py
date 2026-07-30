@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -108,15 +109,33 @@ def _load_motion_probe(before_path: str, after_path: str):
     return lambda: (before, after)
 
 
-def _camera_health_report(frames: int, interval_s: float, *, roi=None, motion_probe=None):
+def _camera_health_report(
+    frames: int = config.VISION_HEALTH_FRAMES,
+    interval_s: float = config.VISION_HEALTH_INTERVAL_S,
+    *,
+    roi=None,
+    motion_probe=None,
+    sleep=time.sleep,
+):
     """Run the standalone noise-floor gate against the real camera (no arm, no motion).
+
+    This is the ONLY place that samples the camera's no-motion noise floor from the
+    CLI -- both ``camera-check`` (`cmd_camera_check`) and ``doctor`` (`cmd_doctor`)
+    route through this one function, which delegates the actual sampling/verdict
+    math to ``camera_health.assess_camera_health``. There must never be a second,
+    independently-tuned set of sampling numbers anywhere in the CLI: the defaults
+    here are the same calibrated ``config.VISION_HEALTH_FRAMES`` /
+    ``config.VISION_HEALTH_INTERVAL_S`` camera-check uses, precisely so a caller that
+    does not override them (doctor, by default) gets an equally-honest measurement.
+    See ``cmd_doctor`` for the one deliberate, opt-in exception (``--quick-camera``).
 
     Returns a ``CameraHealthReport``; on a missing camera returns an ``available``-
     False report rather than raising, so both ``camera-check`` and ``doctor`` degrade
     gracefully. Never commands motion and never opens the HID device. ``roi`` overrides
     ``config.VISION_ROI`` for this one run; ``motion_probe`` (when given) is a callable
     returning a known-real before/after pair whose separation from the live noise
-    floor is measured.
+    floor is measured. ``sleep`` is forwarded to ``assess_camera_health`` purely for
+    test injection (real callers never override it).
     """
     from . import camera_health
 
@@ -138,6 +157,7 @@ def _camera_health_report(frames: int, interval_s: float, *, roi=None, motion_pr
             margin=config.VISION_HEALTH_MARGIN,
             separation=config.VISION_HEALTH_SEPARATION,
             motion_probe=motion_probe,
+            sleep=sleep,
         )
     finally:
         try:
@@ -552,11 +572,30 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
 
 
 def _print_camera_health(report, *, prefix: str = "") -> None:
-    """Human-readable one-block summary of a ``CameraHealthReport``."""
-    verdict = "PASS" if report.healthy else "FAIL"
+    """Human-readable one-block summary of a ``CameraHealthReport``.
+
+    ``report.conclusive`` (default ``True`` for every real measurement; see
+    ``CameraHealthReport``) gates whether a PASS/FAIL verdict is rendered at all.
+    The only producer of a ``conclusive=False`` report today is ``doctor
+    --quick-camera``, whose sample is deliberately too short to span an
+    auto-exposure hunt cycle -- see ``cmd_doctor``. Printing PASS or FAIL from that
+    sample would be worse than printing nothing: on a robot with zero position
+    feedback, a confident-looking FAIL that ``camera-check`` would contradict is
+    actively harmful (it trains an operator to distrust a camera that is actually
+    fine, or -- worse -- to trust a PASS that got lucky mid-hunt). So an inconclusive
+    report gets its own line, never PASS/FAIL text.
+    """
     if not report.available:
         print(f"{prefix}Camera health: FAIL -- {report.reason}")
         return
+    if not report.conclusive:
+        print(f"{prefix}Camera health: not measured -- {report.inconclusive_reason}")
+        print(
+            f"{prefix}  frames sampled:   {report.frames} (interval {report.interval_s:g}s, "
+            f"{report.pairs} pairs) -- too fast to span an auto-exposure hunt cycle, informational only"
+        )
+        return
+    verdict = "PASS" if report.healthy else "FAIL"
     print(f"{prefix}Camera health: {verdict}")
     print(f"{prefix}  frames sampled:   {report.frames} (interval {report.interval_s:g}s, {report.pairs} pairs)")
     print(f"{prefix}  metric:           normalize={report.normalize}")
@@ -620,6 +659,18 @@ def cmd_camera_check(args: argparse.Namespace) -> int:
     return 0 if report.healthy else 1
 
 
+# `doctor --quick-camera`'s deliberately under-calibrated sample. Small and fast
+# (finishes in well under a second) *on purpose* -- this path exists only so an
+# impatient/scripted caller can get a fast presence/sanity check and explicitly
+# opts out of a trustworthy noise-floor verdict to get it. It must NEVER be used
+# as the default: sampling faster than the camera's auto-exposure hunt cycle
+# measures exposure swing, not sensor noise (see the long comment in cmd_doctor
+# below), so a report produced with these numbers is marked `conclusive=False`
+# and `_print_camera_health`/`--json` must never render PASS/FAIL from it.
+QUICK_CAMERA_FRAMES = 5
+QUICK_CAMERA_INTERVAL_S = 0.1
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Report device presence, per-joint calibration status, camera availability,
     and which safety layers are currently active. Never commands any motion."""
@@ -649,27 +700,84 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             "effective_range": [lo, hi],
         }
 
-    # Camera + layer-3 health in one pass. Uses a deliberately small, fast sample
-    # (a handful of frames, short interval) so 'doctor' never hangs, and never
-    # raises for a missing/broken camera -- _camera_health_report returns an
-    # available=False report instead. This both reports presence AND whether the
-    # camera can actually tell motion from its own noise (the layer-3 defect the
-    # camera-check gate exists for) -- a camera that is "available" but noise-blind
-    # is worse than useless for calibration, and doctor should say so.
-    DOCTOR_HEALTH_FRAMES = 5
-    DOCTOR_HEALTH_INTERVAL_S = 0.1
+    # Camera + layer-3 health, routed through the SAME shared helper (and, by
+    # default, the SAME calibrated frames/interval) as `camera-check` --
+    # `_camera_health_report` is the single place that decides how the noise floor
+    # is sampled; doctor must not maintain a second, faster set of numbers.
+    #
+    # Why not just sample fast, always? This camera's auto-exposure *hunts*: it
+    # continuously readjusts brightness/gain even with nothing moving in frame.
+    # Sampling faster than one hunt cycle catches only a single moment mid-swing,
+    # so consecutive frames differ by the *exposure* changing, not by sensor noise
+    # -- and that inflated "noise" can exceed the motion threshold, producing a
+    # confident-looking FAIL that `camera-check` (which samples long enough to
+    # span a full hunt cycle) correctly shows as PASS. On a robot whose ONLY
+    # sensor is this camera, that false FAIL is actively harmful: it either scares
+    # an operator off a perfectly good rig, or -- if ever wired to gate anything
+    # automatically -- fails closed for the wrong reason. A false PASS from an
+    # under-sampled window is just as possible and just as unearned. So the
+    # default here pays the calibrated sampling's full time cost rather than
+    # risk either one.
+    #
+    # `config.VISION_HEALTH_FRAMES` / `config.VISION_HEALTH_INTERVAL_S` are exactly
+    # what `camera-check` uses (frames=15, interval=0.8s on this deployment's
+    # config.json -- see docs/verification-camera.md), so a diagnostic run of
+    # `doctor` costs roughly (frames - 1) * interval_s seconds -- an ESTIMATE:
+    # actual wall time is a little more, since capture + scoring overhead is not
+    # included. ~12s is acceptable for a diagnostic command a human runs
+    # occasionally and expects to wait a moment for, in exchange for a verdict
+    # `doctor` and `camera-check` can never contradict.
+    #
+    # `--quick-camera` is the deliberate, opt-in escape hatch for callers (CI
+    # smoke tests, quick scripted checks) who want doctor to return fast and do
+    # not need a trustworthy noise-floor verdict this run. Because that sample
+    # structurally cannot span a hunt cycle, it must never claim PASS or FAIL --
+    # it is downgraded to `conclusive=False` below and rendered as "not measured"
+    # everywhere (human and --json). Camera *presence* (no camera at all) is a
+    # different, binary fact that quick mode can still report honestly.
+    quick_camera = getattr(args, "quick_camera", False)
+    if quick_camera:
+        frames, interval_s = QUICK_CAMERA_FRAMES, QUICK_CAMERA_INTERVAL_S
+    else:
+        frames, interval_s = config.VISION_HEALTH_FRAMES, config.VISION_HEALTH_INTERVAL_S
+        estimate_s = (frames - 1) * interval_s
+        if not args.json:
+            # Progress note only -- never printed in --json mode, where stdout must
+            # stay pure, machine-parseable JSON (tests and scripts do
+            # json.loads(captured_stdout)). We choose to suppress it entirely rather
+            # than redirect to stderr in json mode, since a --json caller has no use
+            # for a human progress message on either stream and this keeps the
+            # behaviour simple to state: "--json never prints anything but JSON".
+            print(
+                f"Sampling camera noise floor for ~{estimate_s:.0f}s "
+                f"({frames} frames x {interval_s:g}s) ..."
+            )
+
     try:
-        health_report = _camera_health_report(DOCTOR_HEALTH_FRAMES, DOCTOR_HEALTH_INTERVAL_S)
+        health_report = _camera_health_report(frames, interval_s)
     except Exception as e:  # doctor must never raise for a camera problem
         from . import camera_health as _ch
 
         health_report = _ch.CameraHealthReport(
-            available=False, healthy=False, frames=0, interval_s=DOCTOR_HEALTH_INTERVAL_S,
+            available=False, healthy=False, frames=0, interval_s=interval_s,
             pairs=0, noise_p50=0.0, noise_p95=0.0, noise_max=0.0,
             threshold=float(config.VISION_MIN_CHANGED_PIXELS), margin=config.VISION_HEALTH_MARGIN,
             required_threshold=0.0, normalize=config.VISION_NORMALIZE, skipped=True,
             reason=f"camera health check failed: {e}",
         )
+
+    if quick_camera and health_report.available:
+        # The sample above cannot span an auto-exposure hunt cycle by construction,
+        # so whatever `healthy` it computed is not trustworthy either way -- force
+        # it to the non-alarming value and let `conclusive=False` carry the actual
+        # meaning ("not measured"), so nothing downstream mistakes this for a real
+        # verdict just by reading the `healthy` boolean.
+        health_report.healthy = True
+        health_report.conclusive = False
+        health_report.inconclusive_reason = (
+            "not measured (under-calibrated sample; run 'robohand camera-check' for a verdict)"
+        )
+
     camera_available = health_report.available
     camera_error = None if camera_available else health_report.reason
     report["camera"] = {"available": camera_available}
@@ -701,7 +809,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"  {k}: {'ACTIVE' if v else 'inactive (no camera -- layer 3 skipped)'}")
         if not camera_available:
             print("WARNING: no camera detected -- layer 3 (vision stall detection) will not run.")
-        elif not health_report.healthy:
+        elif health_report.conclusive and not health_report.healthy:
             print(
                 "WARNING: camera present but its no-motion noise floor swamps the motion "
                 "threshold -- vision-guided calibration would be unreliable. Run "
@@ -817,6 +925,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("doctor", help="Report device/camera/calibration status and active safety layers")
     p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--quick-camera", action="store_true", dest="quick_camera",
+        help=f"Sample the camera noise floor fast ({QUICK_CAMERA_FRAMES} frames x "
+        f"{QUICK_CAMERA_INTERVAL_S:g}s) instead of the calibrated "
+        f"{config.VISION_HEALTH_FRAMES} frames x {config.VISION_HEALTH_INTERVAL_S:g}s "
+        "camera-check uses. Trades ~12s for well under a second, but the sample is "
+        "too short to span an auto-exposure hunt cycle, so it can never be trusted "
+        "for a PASS/FAIL verdict -- camera health is reported as 'not measured' "
+        "instead. Run 'robohand camera-check' for an authoritative answer.",
+    )
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser(

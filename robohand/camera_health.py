@@ -104,6 +104,20 @@ class CameraHealthReport:
     separation_ok: Optional[bool] = None
     skipped: bool = False
     reason: str = ""
+    # Whether `healthy` (and any PASS/FAIL text derived from it) should be trusted
+    # as a verdict at all. Defaults to True for every report this module produces
+    # itself -- `assess_camera_health` always samples for the caller-given
+    # frames/interval_s and stands behind the result, so nothing here ever sets
+    # this to False. The one producer of `conclusive=False` today is
+    # `cli.cmd_doctor`'s `--quick-camera` path, which samples deliberately fast
+    # (too fast to span an auto-exposure hunt cycle) and downgrades its own report
+    # after the fact rather than let a measurement it does not trust look like a
+    # real verdict. Kept here, not computed in this module, because only the
+    # caller that chose the under-calibrated sampling parameters knows the sample
+    # is under-calibrated -- `assess_camera_health` has no opinion on why it was
+    # called with a given `frames`/`interval_s` and must not guess.
+    conclusive: bool = True
+    inconclusive_reason: str = ""
 
     def as_dict(self) -> dict:
         return dataclasses.asdict(self)
