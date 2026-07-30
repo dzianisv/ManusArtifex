@@ -375,3 +375,36 @@ def test_locator_for_arm_rejects_unknown_backends():
         sim.attach_world(arm._transport, sim.SimObject(x=0.0, y=130.0))
         with pytest.raises(ValueError, match="unknown locator backend"):
             locate.locator_for_arm(arm, "telepathy")
+
+
+def test_missing_google_genai_degrades_even_when_a_client_is_injected(monkeypatch):
+    """A missing optional SDK must surface as LocatorUnavailable, never ModuleNotFoundError.
+
+    Regression for a real drift: ``_get_client`` guarded its ``google.genai``
+    import, but a second, later ``from google.genai import types`` inside
+    ``_ask`` did not. Whenever the client was injected or already cached,
+    ``_get_client`` never ran its guard, so an absent package escaped as a raw
+    ``ModuleNotFoundError`` from the middle of a pick -- breaking the contract
+    documented on ``LocatorUnavailable`` that the other backends keep working.
+    """
+    import importlib
+
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name, *args, **kwargs):
+        if name.startswith("google.genai"):
+            raise ImportError(f"No module named {name!r}")
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+
+    # An injected client means _get_client returns without ever importing the SDK,
+    # so this only passes if the *second* import site is guarded too.
+    loc = GeminiLocator(
+        lambda: make_frame([]),
+        client=FakeGeminiClient(["[]"]),
+        allow_bitwarden=False,
+    )
+    with pytest.raises(LocatorUnavailable) as excinfo:
+        loc.locate_object()
+    assert "google-genai" in str(excinfo.value)

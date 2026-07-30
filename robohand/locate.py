@@ -84,6 +84,31 @@ class LocatorUnavailable(LocatorError):
     """
 
 
+def _import_genai(module: str):
+    """Import an optional ``google-genai`` module, or raise ``LocatorUnavailable``.
+
+    Every lazy import of ``google-genai`` must go through here. The package is an
+    optional dependency, and the contract in ``LocatorUnavailable`` is that a
+    missing install degrades to "this backend is unavailable" so the other
+    locator backends keep working -- it must never surface as a raw
+    ``ModuleNotFoundError`` from somewhere in the middle of a pick.
+
+    Centralised precisely because it drifted once: the client import was guarded
+    but a second, later ``from google.genai import types`` was not, so a missing
+    package still escaped as ``ModuleNotFoundError`` whenever the client had been
+    injected or already cached.
+    """
+    import importlib
+
+    try:
+        return importlib.import_module(module)
+    except ImportError as e:  # pragma: no cover - depends on the environment
+        raise LocatorUnavailable(
+            "the 'google-genai' package is not installed, so the Gemini locator "
+            "cannot be used. Install it or choose another --locator backend."
+        ) from e
+
+
 @dataclasses.dataclass(frozen=True)
 class ObjectLocation:
     """Where a locator believes the target object is, in source-frame pixels."""
@@ -451,13 +476,7 @@ class GeminiLocator(Locator):
                 "or --locator sim, or configure the key. The key value is never "
                 "printed by this package."
             )
-        try:
-            from google import genai  # noqa: WPS433 -- deliberately lazy
-        except ImportError as e:  # pragma: no cover - depends on the environment
-            raise LocatorUnavailable(
-                "the 'google-genai' package is not installed, so the Gemini locator "
-                "cannot be used. Install it or choose another --locator backend."
-            ) from e
+        genai = _import_genai("google.genai")
         self._client = genai.Client(api_key=api_key)
         return self._client
 
@@ -472,7 +491,7 @@ class GeminiLocator(Locator):
 
     def _ask(self, frame: np.ndarray, target: str) -> str:
         client = self._get_client()
-        from google.genai import types  # noqa: WPS433 -- deliberately lazy
+        types = _import_genai("google.genai.types")
 
         response = client.models.generate_content(
             model=self._model,

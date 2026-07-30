@@ -12,6 +12,14 @@ dependencies = [
     "hidapi>=0.14",
 ]
 
+# The Gemini locator backend is optional: robohand.locate degrades to
+# LocatorUnavailable and the classical/sim backends keep working without it.
+# It is an extra rather than a hard dependency so a plain install stays small,
+# but the locator's tests do exercise the real payload construction, so it must
+# be installed to run the full suite.
+[project.optional-dependencies]
+gemini = ["google-genai>=1.0"]
+
 [project.scripts]
 robohand = "robohand.cli:main"
 
