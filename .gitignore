@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .worktrees/
+
+# Local agent session memory -- notes to self, not project history.
+.agents/memory/
