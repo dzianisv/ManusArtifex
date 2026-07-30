@@ -1,156 +1,155 @@
-# The robot's brain: what should be AI, and what should not
+# Robot brain design
 
-Date: 2026-07-30. Supersedes the perception half of `docs/verification-camera.md`
-as *policy*; the measurements there stay valid.
+Date: 2026-07-30. Hardware: Hiwonder LeArm, LSC-6 controller, 6 PWM servos, 1 USB webcam, MacBook.
 
-## The mistake this document corrects
+## The constraint
 
-Every vision-based decision in this project ran through one question: **how many
-pixels changed between two frames?** (`robohand/guard.py`). Calibration used it to
-decide whether a joint moved. `pick.py` used it to check a grasp. The camera-health
-gate existed to check whether the question was even answerable.
+The servos report nothing. No position, no current, no temperature. The controller only sends PWM out.
 
-That question is not about the arm. Measured on 2026-07-30, arm perfectly still:
+The camera is the only sensor.
 
-| scene | no-motion floor (p95) | verdict at threshold 3,000 |
+## What was wrong
+
+Every vision decision asked one question: how many pixels changed between two frames?
+
+That question is about the room, not the arm. Measured 2026-07-30, arm held still:
+
+| Scene | Noise floor (p95) | Gate at threshold 3,000 |
 |---|---:|---|
-| nobody in the room | 1,243 changed px | PASS |
-| one person seated in frame | 43,335 | FAIL |
-| same person, cropped out of the ROI | 5,869–13,676 | FAIL |
-| same person, tight crop on the arm | 6,375 | FAIL |
+| Empty room | 1,243 changed px | PASS |
+| One person in frame | 43,335 | FAIL |
+| Person cropped out of the ROI | 5,869–13,676 | FAIL |
+| Tight crop on the arm only | 6,375 | FAIL |
 
-A person shifting in a chair produces a bigger signal than the joint we are trying
-to measure. Three fixes were tried and all three lose: a tighter ROI (the person's
-reflection is in the TV, and auto-exposure reacts to them and shifts the *whole*
-frame), a brightness-normalised metric (`vision.normalize=zscore` — worse, 10,000
-vs 6,375), and a higher threshold (it would then sit above real motion too).
+A person shifting in a chair beats the signal from a moving joint.
 
-They lose because **signal and noise are the same kind of thing.** No threshold
-separates "the arm moved" from "a human moved" when the only measurement is "some
-pixels are different now". The fix is not a better threshold. It is a different
-question.
+Three fixes were tried. All three failed:
 
-## What everyone else does
+- Tighter ROI. The person's reflection is in the TV. Auto-exposure reacts to them and shifts the whole frame.
+- Brightness normalisation (`vision.normalize=zscore`). Worse: 10,000 vs 6,375.
+- Higher threshold. It would then sit above real motion too.
 
-**1. Joint encoders — the normal answer, closed to us.** Every arm LeRobot supports
-(SO-100, Koch, OMX, Reachy2, …) reports its own joint positions, and the standard
-loop is `obs = robot.get_observation(); action = model.select_action(obs);
-robot.send_action(action)`. Our LSC-6 emits PWM and reads nothing back
-(`docs/research-hardware.md`). This also closes the door on imitation learning —
-ACT and diffusion policies need readable state on both the teleop-recording side
-and the execution side, so "just train a policy like LeRobot does" is not available
-until the servos are replaced with bus servos (costed in the Notion servo page:
-~6 × $16.99 + a controller, a multi-week project).
+No threshold separates "the arm moved" from "a human moved" when the measurement is "some pixels differ".
 
-**2. Fiducial markers — the standard substitute on cheap hardware.** A printed
-pattern with a known id, found by a detector looking for *that pattern*. Ships
-inside OpenCV as `cv2.aruco` (present here, OpenCV 5.0). This is what people put on
-a gripper when they have no encoders, and it is what `robohand/markers.py` now
-implements.
+## The three options, and which one we can use
 
-**3. A VLM — for meaning, not for geometry.** Gemini Robotics-ER 1.6 is on our key
-and works, and Google's own guidance is to pair it with a low-level controller you
-supply. This project already tested it on a real photo of this arm
-(`docs/cocktail-robot.md`, 2026-07-28): it pointed at the gripper **20–30 px off**
-and **hallucinated a graspable object in a frame that contained none**. So: a VLM
-is the right tool for "which bottle is the gin" and the wrong tool for "is the claw
-2 mm left of the bottle".
+**Joint encoders.** What LeRobot-supported arms use. `obs = robot.get_observation()` → `select_action`. Closed to us: the LSC-6 reads nothing back. This also rules out imitation learning (ACT, diffusion, OpenVLA, π0) — those need readable joint state to record demos and to execute. Opening it means replacing all six servos with bus servos plus a new controller. Multi-week.
 
-## The architecture
+**Fiducial markers.** A printed pattern with a known ID. The detector looks for that pattern only. Ships in OpenCV as `cv2.aruco`. This is the standard substitute when there are no encoders. **Chosen.**
 
-Three layers, split by what each one is actually good at. Nothing crosses.
+**A VLM.** Good at meaning. Bad at geometry. Tested on this arm 2026-07-28: Gemini Robotics-ER 1.6 missed the gripper by 20–30 px and reported a graspable object in a frame that had none. Google's own guidance is to pair ER with a low-level controller you supply.
+
+## Design
 
 ```
-  ┌─ SEMANTICS ──────────────────────────────────────────────────────┐
-  │  LLM agent (pi) + VLM                                            │
-  │  "which object do I want", "is this a bottle or a glass",        │
-  │  "the plan is: approach, grasp, lift, verify"                    │
-  │  Slow (1-3 s), costs money, occasionally invents. Never trusted  │
-  │  for a number that a servo will act on.                          │
-  └────────────────────────┬─────────────────────────────────────────┘
-                           │ symbolic goals: "grasp marker 1"
-  ┌─ GEOMETRY ─────────────▼─────────────────────────────────────────┐
-  │  Fiducial markers (robohand/markers.py)                          │
-  │  "marker 0 is at (412, 233), marker 1 at (455, 240)"             │
-  │  ~10 ms, free, deterministic, and a person is not a marker.      │
-  │  This is the error signal the control loop closes on.            │
-  └────────────────────────┬─────────────────────────────────────────┘
-                           │ pixel error
-  ┌─ SAFETY + ACTUATION ───▼─────────────────────────────────────────┐
-  │  robohand safety layer, unchanged                                │
-  │  bands, absolute rails, single-use move tokens, torque budget    │
-  │  Refuses anything the layers above ask for that is out of range. │
-  └──────────────────────────────────────────────────────────────────┘
+   YOU
+    │  "pick up the bottle"
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ MEANING          LLM agent (pi) + VLM               │
+│                  Which object. What order. When to  │
+│                  stop. Reads an annotated frame.    │
+│                  1–3 s. Costs money. Can be wrong.  │
+└─────────────────────────┬───────────────────────────┘
+                          │  names a target: "marker 1"
+                          │  never a joint angle
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│ GEOMETRY         ArUco markers (robohand/markers.py)│
+│                  marker 0 = gripper, at (412, 233)  │
+│                  marker 1 = object,  at (455, 240)  │
+│                  10 ms. Free. Deterministic.        │
+│                  A person is not a marker.          │
+└─────────────────────────┬───────────────────────────┘
+                          │  pixel error: 43 px right, 7 px down
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│ CONTROL          Visual servo loop                  │
+│                  Step the joint. Re-measure. Repeat.│
+│                  No IK. No hand-eye calibration.    │
+└─────────────────────────┬───────────────────────────┘
+                          │  requested move
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│ SAFETY           robohand safety layer (unchanged)  │
+│                  Joint bands. Absolute rails.       │
+│                  Single-use move tokens.            │
+│                  Torque time budget. CAN REFUSE.    │
+└─────────────────────────┬───────────────────────────┘
+                          ▼
+                       SERVOS
 ```
 
-The layering is the point. The LLM decides *what*; markers measure *where*;
-deterministic code decides *whether it is allowed*. A hallucinating model cannot
-produce a bad servo command, because it never emits one — it names a marker id.
+The model names a marker. It never sends a number to a servo. A wrong answer from the model cannot become a bad servo command.
 
-## Why markers, concretely
+## Evidence
 
-Same two frames — arm still, large high-contrast clutter moving elsewhere
-(`tests/test_markers.py`, run head to head):
+Same two frames. Arm still. Large clutter moving elsewhere.
 
 ```
-absdiff  -> 106,750 changed px   (threshold 3,000  -> "MOTION", wrong)
-markers  ->       0.00 px moved  (threshold 3.0    -> "no motion", right)
+absdiff  ->  106,750 changed px   threshold 3,000  ->  "MOTION"     wrong
+markers  ->        0.00 px moved  threshold   3.0  ->  "no motion"  right
 ```
 
-And on a real photograph of this room, with a person in it: **zero markers
-detected**. Not "below threshold" — absent from the result. There is nothing to
-tune, because the room is not in the measurement.
+`robohand markers` on the live camera with a person in frame: 0 markers found. Not below threshold. Absent.
 
-Three properties follow, and they are why this replaces rather than supplements the
-absdiff path for anything the arm must trust:
+## Rules
 
-- **No noise floor, no ROI, no health gate.** `camera-check` exists to decide
-  whether absdiff is answerable today. That whole question disappears.
-- **The answer is a distance, not a statistic.** "The gripper moved 40 px" composes
-  into a control loop. "17,000 pixels changed" does not.
-- **Absence is distinguishable from stillness.** A marker that is not detected
-  raises, it does not return "no motion" — because `calibrate` infers a mechanical
-  stop from repeated no-motion, and a marker falling off would otherwise be written
-  into `config.json` as a joint limit.
+- A marker that is not detected raises an error. It never reports "no motion". `calibrate` infers mechanical stops from repeated no-motion, so a marker falling off would otherwise be written into `config.json` as a joint limit.
+- The VLM never returns a coordinate that reaches a servo.
+- The safety layer is not modified by any of this.
+- The absdiff path stays. It is still a cheap stall check during one commanded move, where a false positive is harmless and the marker may be hidden by the arm.
 
-## What is built (2026-07-30)
+## Not built
 
-- `robohand/markers.py` — detection, a printable sheet generator, and
-  `ArucoMotionObserver`, which implements the existing `MotionObserver` interface
-  so `calibrate` cannot tell the difference.
-- `robohand markers --generate sheet.png` — print it, tape marker 0 to the gripper,
-  marker 1 to the object.
-- `robohand markers` — what the camera can see right now. Exit 0 if any marker is
-  found, 1 if none, so it works as a pre-flight.
-- `robohand calibrate --observer aruco --marker-id 0` — calibrate with a person in
-  the room.
-- 15 tests, including the head-to-head above and a real room photograph.
+- No `solvePnP` pose estimation. It needs camera intrinsics. Nobody has run a checkerboard calibration on this webcam.
+- No hand-eye calibration. No inverse kinematics. The loop servos in image space.
+- No VLA. Requires joint state we do not have.
 
-## What is deliberately NOT built
+## Cost
 
-- **No pose estimation (`solvePnP`).** That needs camera intrinsics from a
-  checkerboard calibration nobody has run on this webcam. A confidently wrong 3D
-  pose is worse than an honest 2D one. The seam is marked in `MarkerView`.
-- **No hand-eye calibration, no IK.** The pick loop servos in image space
-  (`docs/pick.md`) and does not need either.
-- **No VLA.** Every VLA surveyed needs readable joint state (`docs/cocktail-robot.md`).
-  Unchanged by any of this.
-- **The absdiff path is not deleted.** It is still the right cheap check for "did
-  *anything* move" as a stall guard during a single commanded move, where a false
-  positive is harmless and a marker may be occluded by the arm itself.
+Markers must be printed, taped on, and stay stuck. They must be unoccluded at the poses that matter. That is recurring physical maintenance, like camera aim.
 
-## The honest limitation
+## Status
 
-Markers must be physically stuck to the arm and stay stuck, and they must be big
-enough to resolve and unoccluded at the poses that matter. That is a real,
-recurring maintenance cost, and it is a *physical* dependency exactly like the
-camera aim. It buys determinism, not freedom from the workshop.
+| Item | State |
+|---|---|
+| `robohand/markers.py` + `ArucoMotionObserver` | Built. 15 tests. |
+| `robohand markers --generate` / `robohand markers` | Built. |
+| `robohand calibrate --observer aruco` | Built. |
+| Markers physically taped to arm | **Operator. 2 minutes.** |
+| WRIST_ROLL calibration | Blocked on the above. |
+| SHOULDER_LIFT (servo 5) | **Broken. Intermittent.** See docs/hardware-fault-servo5.md. |
 
 ## Next
 
-1. Print `robohand markers --generate`, tape marker 0 to the gripper.
-2. `robohand markers` to confirm it is seen at the poses that matter.
-3. `robohand calibrate --observer aruco --joint WRIST_ROLL --i-am-present-and-watching`
-   — with the room occupied, which is the whole point.
-4. Then the pick loop closes on marker 0 vs marker 1, with the LLM choosing the
-   target and calling abort.
+1. `robohand markers --generate sheet.png`. Print. Tape marker 0 to the gripper, marker 1 to the bottle.
+2. `robohand markers` to confirm both are seen.
+3. `robohand calibrate --observer aruco --joint WRIST_ROLL --i-am-present-and-watching`.
+4. Close the pick loop on marker 0 vs marker 1.
+
+## References
+
+Fetched and read 2026-07-30 unless noted.
+
+**Approach we chose**
+
+- OpenCV, *Detection of ArUco Markers*. <https://docs.opencv.org/4.x/d5/dae/tutorial_aruco_detection.html> — the detector, the dictionaries, and the quiet-zone requirement.
+
+**LLM as planner, not as controller** — the pattern this design follows
+
+- Liang et al., *Code as Policies: Language Model Programs for Embodied Control*, arXiv:2209.07753. <https://arxiv.org/abs/2209.07753> — the LLM writes a program that calls perception and control APIs. It does not emit motor commands.
+- Ahn et al., *Do As I Can, Not As I Say: Grounding Language in Robotic Affordances* (SayCan), arXiv:2204.01691. <https://arxiv.org/abs/2204.01691> — the model proposes, a separate layer decides what is physically possible.
+- Google, *Gemini Robotics ER*, Gemini API docs. <https://ai.google.dev/gemini-api/docs/robotics-overview> — ER outputs points and boxes, and the docs say to pair it with a low-level controller you supply.
+
+**End-to-end learned control** — surveyed and ruled out, all need joint state
+
+- Kim et al., *OpenVLA: An Open-Source Vision-Language-Action Model*, arXiv:2406.09246. <https://arxiv.org/abs/2406.09246>
+- Black et al., *π₀: A Vision-Language-Action Flow Model for General Robot Control*, arXiv:2410.24164. <https://arxiv.org/abs/2410.24164>
+- Hugging Face, *LeRobot*. <https://github.com/huggingface/lerobot> — supported arms (SO-100, Koch, OMX, Reachy2) all report joint state; the standard loop is `get_observation` → `select_action` → `send_action`.
+
+**This project's own measurements**
+
+- `docs/cocktail-robot.md` — the 2026-07-28 Gemini ER 1.6 test on a real photo of this arm: gripper missed by 20–30 px, hallucinated object.
+- `docs/camera-field-of-view.md` — the noise-floor table above.
+- `docs/research-hardware.md` — what the LSC-6 can and cannot report.
