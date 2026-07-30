@@ -477,6 +477,64 @@ def cmd_pick(args: argparse.Namespace) -> int:
     return 0 if result.success else 1
 
 
+def cmd_markers(args: argparse.Namespace) -> int:
+    """Generate or detect fiducial markers. Never commands motion, never opens HID.
+
+    Exit codes are the useful part: 0 when at least one marker was found (or a
+    sheet was written), 1 when the frame contained none. That makes it usable as a
+    pre-flight in a script -- ``robohand markers || echo 'retape the gripper'``.
+    """
+    from . import markers as markers_module
+
+    if args.generate:
+        import cv2
+
+        sheet = markers_module.render_sheet(args.ids)
+        cv2.imwrite(args.generate, sheet)
+        print(f"Wrote marker sheet for ids {args.ids} to {args.generate}")
+        print(
+            "Print it at any size, leaving the WHITE border intact -- the detector finds\n"
+            "the pattern by its quiet zone, so a marker cut flush to the black edge or\n"
+            "taped onto a dark surface will not be seen. Bigger is better: the marker must\n"
+            "be tens of pixels across in the camera's view, not a smudge."
+        )
+        return 0
+
+    import cv2
+
+    if args.image:
+        frame = cv2.imread(args.image)
+        if frame is None:
+            print(f"error: could not read image {args.image}", file=sys.stderr)
+            return 2
+        source = args.image
+    else:
+        from . import camera as camera_module
+
+        with camera_module.Camera(camera_module.CameraConfig(index=0)) as cam:
+            frame = cam.grab()
+        source = "camera 0"
+        if frame is None:
+            print("error: camera returned no frame", file=sys.stderr)
+            return 2
+
+    found = markers_module.detect(frame)
+    if args.json:
+        print(json.dumps({"source": source, "markers": [v.as_dict() for _, v in sorted(found.items())]}, indent=2))
+    else:
+        print(f"Markers in {source}: {len(found)}")
+        for marker_id, view in sorted(found.items()):
+            x, y = view.centre
+            print(f"  id {marker_id:<3} centre ({x:7.1f}, {y:7.1f})  edge {view.size_px:5.1f} px")
+        if not found:
+            print(
+                "  none. Nothing in this frame is a marker -- which is the point: people,\n"
+                "  pets, reflections and exposure shifts are all invisible to this detector.\n"
+                "  Generate a sheet with --generate, print it, and tape one to the gripper."
+            )
+    return 0 if found else 1
+
+
 def cmd_calibrate(args: argparse.Namespace) -> int:
     """Vision-guided auto-calibration, or promotion of an earlier result.
 
@@ -545,10 +603,27 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
 
     joints = args.joint if args.joint else None
     roi = tuple(args.roi) if getattr(args, "roi", None) is not None else None
+    use_markers = getattr(args, "observer", "absdiff") == "aruco"
+    if use_markers and roi is not None:
+        print("error: --roi aims the absdiff observer; the marker observer does not use one",
+              file=sys.stderr)
+        return 2
     with _make_arm(args) as arm:
         try:
-            observer = observer_for_arm(arm, roi=roi) if roi is not None else None
-            if roi is not None:
+            observer = None
+            if use_markers:
+                from . import markers as markers_module
+
+                guard = getattr(arm, "vision_guard", None)
+                if guard is None or not guard.available():
+                    print("error: no camera, so no markers can be seen", file=sys.stderr)
+                    return 2
+                observer = markers_module.ArucoMotionObserver(
+                    guard.frame_source, marker_id=args.marker_id
+                )
+                print(f"Observer: {observer.describe()}")
+            elif roi is not None:
+                observer = observer_for_arm(arm, roi=roi)
                 print(f"Observer ROI overridden for this run: {list(roi)} (config.json unchanged)")
             run = calibration.calibrate(
                 arm,
@@ -970,6 +1045,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_camera_check)
 
     p = sub.add_parser(
+        "markers",
+        help="Detect ArUco fiducials in the live frame, or print a marker sheet to tape on",
+        description="Fiducial markers replace 'how many pixels changed' with 'where is marker N'. "
+        "A person, a cat, a TV reflection and an auto-exposure shift are all simply not markers, "
+        "so none of them can be mistaken for the arm moving. Commands no motion and needs no arm. "
+        "See docs/robot-brain.md.",
+    )
+    p.add_argument("--generate", metavar="PATH", default=None,
+                   help="Write a printable marker sheet to PATH instead of looking at the camera. "
+                        "Print it, cut with a WHITE border left on (the detector needs that quiet "
+                        "zone), and tape one to the gripper and one to the object.")
+    p.add_argument("--ids", type=int, nargs="+", default=[0, 1, 2],
+                   help="Marker ids to generate (default: gripper 0, object 1, base 2)")
+    p.add_argument("--image", metavar="PATH", default=None,
+                   help="Detect in an image file instead of the live camera")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_markers)
+
+    p = sub.add_parser(
         "calibrate",
         help="Vision-guided auto-calibration of a joint's real mechanical limits, "
         "or promotion of a previous result into config.json",
@@ -988,6 +1082,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="With --apply, permit promoting a result produced against the simulator. "
                    "Simulated limits are assumptions about this arm, not measurements of it.")
     p.add_argument("--step", type=int, default=None, help="Probe increment in raw units (default 30)")
+    p.add_argument("--observer", choices=("absdiff", "aruco"), default="absdiff",
+                   help="How to tell whether a joint moved. 'absdiff' (default) counts changed "
+                        "pixels and is what the camera-health gate measures -- it is sensitive to "
+                        "anything else moving in the room. 'aruco' tracks one printed fiducial's "
+                        "centre instead, which a person, a pet or an exposure shift cannot imitate. "
+                        "Requires a marker taped to the link this joint moves (robohand markers "
+                        "--generate). See docs/robot-brain.md.")
+    p.add_argument("--marker-id", type=int, default=0, dest="marker_id",
+                   help="Which marker id the --observer aruco run should follow (default 0)")
     p.add_argument("--roi", type=float, nargs=4, metavar=("X", "Y", "W", "H"), default=None,
                    help="Aim the motion observer at part of the frame for this run (>1 = pixels, "
                         f"<=1 = frame fractions; default vision.roi = {list(config.VISION_ROI)}). "

@@ -33,6 +33,7 @@ Start with [docs/safety.md](docs/safety.md) — it explains the gripper incident
 and the three defence rings everything else is built on.
 
 - [docs/safety.md](docs/safety.md) — safety architecture, limits, and procedures
+- [docs/robot-brain.md](docs/robot-brain.md) — **what should be AI and what should not**: why pixel-differencing was replaced with fiducial markers, and where the LLM belongs
 - [docs/calibration.md](docs/calibration.md) — vision-assisted joint calibration
 - [docs/camera-field-of-view.md](docs/camera-field-of-view.md) — **open blocker:** the camera cannot see the gripper
 - [docs/hardware-fault-servo5.md](docs/hardware-fault-servo5.md) — the servo-5 fault, and how it was cleared
