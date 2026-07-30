@@ -485,6 +485,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     one), ``--all`` (calibrate every joint).
     """
     from . import calibrate as calibration
+    from .observer import observer_for_arm
 
     if args.apply:
         applied = calibration.apply_calibration(
@@ -543,12 +544,17 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     settings = calibration.CalibrationSettings(**settings_kwargs)
 
     joints = args.joint if args.joint else None
+    roi = tuple(args.roi) if getattr(args, "roi", None) is not None else None
     with _make_arm(args) as arm:
         try:
+            observer = observer_for_arm(arm, roi=roi) if roi is not None else None
+            if roi is not None:
+                print(f"Observer ROI overridden for this run: {list(roi)} (config.json unchanged)")
             run = calibration.calibrate(
                 arm,
                 joints,
                 settings=settings,
+                observer=observer,
                 output_dir=Path(args.out_dir) if args.out_dir else None,
             )
         except KeyboardInterrupt:
@@ -982,6 +988,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="With --apply, permit promoting a result produced against the simulator. "
                    "Simulated limits are assumptions about this arm, not measurements of it.")
     p.add_argument("--step", type=int, default=None, help="Probe increment in raw units (default 30)")
+    p.add_argument("--roi", type=float, nargs=4, metavar=("X", "Y", "W", "H"), default=None,
+                   help="Aim the motion observer at part of the frame for this run (>1 = pixels, "
+                        f"<=1 = frame fractions; default vision.roi = {list(config.VISION_ROI)}). "
+                        "config.json is not modified. Use the SAME values with `camera-check --roi` "
+                        "first: the health gate this run must pass is measured over the same crop. "
+                        "The reason it exists is people -- a human moving anywhere in frame raises "
+                        "the no-motion floor far above the motion threshold and the run is refused.")
     p.add_argument("--margin", type=int, default=None,
                    help="Back-off from the last confirmed-moving position, in raw units (default 60)")
     p.add_argument("--confirmations", type=int, default=None,

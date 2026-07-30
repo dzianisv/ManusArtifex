@@ -62,12 +62,21 @@ DEFAULT_DELTA = 120
 MIN_SAFE_VOLTS = 6.6
 
 
-def _build_guard(cam: Camera) -> VisionGuard:
+def _build_guard(cam: Camera, roi=None) -> VisionGuard:
     """Exactly the guard ``robohand`` builds itself -- same ROI, same threshold,
-    same normalisation -- so scores are comparable to ``camera-check`` output."""
+    same normalisation -- so scores are comparable to ``camera-check`` output.
+
+    ``roi`` overrides ``config.VISION_ROI`` for this run only, mirroring
+    ``robohand camera-check --roi``. Needed because the scene this arm lives in has
+    a *person* in it: on 2026-07-30 a human moving in the right of the frame lifted
+    the full-frame no-motion floor to p95=43,335 changed px, 14x the 3,000 motion
+    threshold, which would drown any joint's signal. Cropping them out returned it
+    to p95=1,243. Comparability with ``camera-check`` is preserved by passing that
+    command the same ``--roi``.
+    """
     return VisionGuard(
         frame_source=cam.grab,
-        roi=config.VISION_ROI,
+        roi=roi if roi is not None else config.VISION_ROI,
         diff_threshold=config.VISION_DIFF_THRESHOLD,
         min_changed_pixels=config.VISION_MIN_CHANGED_PIXELS,
         blur_ksize=config.VISION_BLUR_KSIZE,
@@ -164,6 +173,10 @@ def main() -> int:
     ap.add_argument("--delta", type=int, default=DEFAULT_DELTA, help=f"Half-amplitude, raw units (default {DEFAULT_DELTA}).")
     ap.add_argument("--duration-ms", type=int, default=2000, help="Move duration; longer is gentler (default 2000).")
     ap.add_argument("--settle-s", type=float, default=0.6, help="Pause after each move before capturing (default 0.6).")
+    ap.add_argument("--roi", type=float, nargs=4, metavar=("X", "Y", "W", "H"), default=None,
+                    help="Override the ROI for this run (>1 = pixels, <=1 = frame fractions). "
+                         "Same semantics as `robohand camera-check --roi`; pass both the same "
+                         "values to keep the scores comparable.")
     args = ap.parse_args()
 
     for joint in args.joints:
@@ -180,7 +193,7 @@ def main() -> int:
     # what keep it safe.
     arm = Arm(use_vision=False)
     try:
-        guard = _build_guard(cam)
+        guard = _build_guard(cam, roi=tuple(args.roi) if args.roi is not None else None)
         v0 = arm.battery_voltage()
         print(f"pack before any motion: {v0:.3f} V" if v0 is not None else "pack voltage unreadable")
         if v0 is not None and v0 < MIN_SAFE_VOLTS:

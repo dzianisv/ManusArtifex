@@ -54,6 +54,7 @@ about *how much* an observer sees, not only the yes/no answer:
 from __future__ import annotations
 
 import abc
+import dataclasses
 import random
 from typing import Any, Iterable, Optional, Sequence
 
@@ -409,11 +410,28 @@ class NoisyMotionObserver(MotionObserver):
         )
 
 
-def observer_for_arm(arm, *, servo_ids: Optional[Iterable[int]] = None) -> MotionObserver:
+def observer_for_arm(
+    arm,
+    *,
+    servo_ids: Optional[Iterable[int]] = None,
+    roi=None,
+) -> MotionObserver:
     """Best available observer for ``arm``: the sim stand-in, or its camera guard.
 
     Raises ``ObserverError`` if neither is usable -- calibration without any way to
     tell whether a joint moved is not a degraded mode, it is a nonsense operation.
+
+    ``roi`` (``(x, y, w, h)``, pixels if >1, frame fractions if <=1) narrows the
+    region the observer judges motion in, for this call only, leaving
+    ``config.VISION_ROI`` alone. It exists because the room this arm lives in
+    contains *people*: on 2026-07-30 a human moving in the right of the frame put
+    the full-frame no-motion floor at p95=43,335 changed px against a 3,000 motion
+    threshold, so the camera-health gate correctly refused to calibrate at all.
+    Cropping the person out returned the floor to p95=1,243 and the same camera
+    passed. Aiming the observer is the fix; loosening the threshold would not be.
+
+    The sim path ignores ``roi`` -- ``SimMotionObserver`` reads the transport's own
+    joint positions and has no frame to crop.
     """
     if getattr(arm, "sim", False):
         return SimMotionObserver(arm._transport, servo_ids=servo_ids)
@@ -425,4 +443,6 @@ def observer_for_arm(arm, *, servo_ids: Optional[Iterable[int]] = None) -> Motio
             "cannot answer that (there is no position feedback on this controller). "
             "Attach a camera, or calibrate by hand (docs/safety.md)."
         )
+    if roi is not None:
+        guard = dataclasses.replace(guard, roi=tuple(roi))
     return VisionMotionObserver(guard)

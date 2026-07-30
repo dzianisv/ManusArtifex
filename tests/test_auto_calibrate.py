@@ -1244,3 +1244,83 @@ def test_cli_apply_refuses_a_widened_file(tmp_path, capsys, monkeypatch):
     assert cli.main(["--sim", "calibrate", "--apply", str(forged)]) == 2
     assert "absolute rail" in capsys.readouterr().err
     assert json.loads(config_copy.read_text())["servos"]["GRIP"]["calibrated"] is False
+
+
+# ---------------------------------------------------------------------------
+# Aiming the observer: `calibrate --roi`
+#
+# Why this exists: the arm shares a room with people. On 2026-07-30 a human
+# moving in the right of the frame put the full-frame no-motion floor at
+# p95=43,335 changed px against a 3,000 motion threshold, so the camera-health
+# gate refused to calibrate -- correctly. Cropping them out returned it to
+# p95=1,243 and the same camera passed. Aiming is the fix; loosening is not.
+# ---------------------------------------------------------------------------
+
+def test_observer_roi_override_does_not_touch_the_configured_roi():
+    """A per-run crop is a diagnostic, not a config edit."""
+    from robohand import config
+    from robohand.guard import VisionGuard
+    from robohand.observer import observer_for_arm
+
+    configured = config.VISION_ROI
+
+    class _Arm:
+        sim = False
+        vision_guard = VisionGuard(frame_source=lambda: None, roi=configured)
+
+    observer = observer_for_arm(_Arm(), roi=(0, 0, 820, 720))
+
+    assert observer._guard.roi == (0, 0, 820, 720)
+    assert _Arm.vision_guard.roi == configured, "the arm's own guard must be untouched"
+    assert config.VISION_ROI == configured, "config.json's ROI must be untouched"
+
+
+def test_observer_without_an_roi_keeps_the_arms_own_guard():
+    """No --roi means no surprise: the observer judges exactly what it always did."""
+    from robohand.guard import VisionGuard
+    from robohand.observer import observer_for_arm
+
+    guard = VisionGuard(frame_source=lambda: None, roi=(0, 0, 1.0, 1.0))
+
+    class _Arm:
+        sim = False
+        vision_guard = guard
+
+    assert observer_for_arm(_Arm())._guard is guard
+
+
+def test_cli_calibrate_threads_the_roi_into_the_observer(tmp_path, fast, monkeypatch):
+    """End to end through argparse: --roi must reach the observer the run judges
+    motion with, because that observer is also what the camera-health gate measures.
+    A flag that parsed but was dropped would leave the gate reading the whole frame
+    and refusing exactly the runs this flag exists to allow."""
+    from robohand import cli
+    from robohand import calibrate as calibration_module
+
+    seen = {}
+    real = calibration_module.calibrate
+
+    def spy(arm, joints, **kwargs):
+        seen["observer"] = kwargs.get("observer")
+        return real(arm, joints, **kwargs)
+
+    monkeypatch.setattr(calibration_module, "calibrate", spy)
+    rc = cli.main([
+        "--sim", "calibrate", "--joint", "WRIST_ROLL", "--roi", "0", "0", "820", "720",
+        "--step", "30", "--margin", "60", "--step-duration", "20",
+        "--out-dir", str(tmp_path), "--json",
+    ])
+
+    assert rc == 0
+    assert seen["observer"] is not None, "--roi was parsed and then dropped on the floor"
+
+
+def test_a_sim_run_ignores_the_roi_rather_than_pretending_to_crop():
+    """SimMotionObserver reads joint positions out of the transport; it has no frame
+    to crop. Silently accepting an ROI there would imply a crop that cannot exist."""
+    from robohand.arm import Arm
+    from robohand.observer import SimMotionObserver, observer_for_arm
+
+    with Arm(sim=True, use_vision=False, install_signal_handlers=False) as arm:
+        observer = observer_for_arm(arm, roi=(0, 0, 10, 10))
+        assert isinstance(observer, SimMotionObserver)

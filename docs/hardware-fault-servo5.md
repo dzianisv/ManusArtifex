@@ -1,12 +1,63 @@
 # Hardware fault: servo 5 (SHOULDER_LIFT) non-responsive
 
-Status: **RESOLVED 2026-07-29 — the joint responds. No replacement is needed.**
-Found: 2026-07-28, first full hardware session after the gripper stall incident.
-Cleared: 2026-07-29, on the next live session, after the operator worked on the arm.
+Status: **OPEN AGAIN, 2026-07-30 — and now known to be INTERMITTENT.**
+Found: 2026-07-28. Cleared: 2026-07-29. Failed again: 2026-07-30, right after the
+arm was physically moved.
 
-## Resolution (2026-07-29)
+## The intermittency is the finding (2026-07-30)
 
-`SHOULDER_LIFT` moves. It was re-probed with `joint_probe.py`, which reads **two**
+| Date | What happened to the arm just before | Motion | Pack |
+|------|--------------------------------------|-------:|------|
+| 07-28 | power-cycled and handled after the stall incident | 230-330 px (noise floor 335) | flat |
+| 07-29 | operator handled the arm between sessions | 134,641 px | 0.60 V sag |
+| 07-30 | operator moved the camera and the robot | 0-2 px | 0.008 V |
+
+The joint works after the arm is handled and stops working after the arm is
+handled. That pattern is mechanical, not electrical: a winding or a driver IC does
+not heal itself and then fail again on being carried. It fits **family B** below —
+a horn screw or linkage that is not holding — far better than family A.
+
+Measured today, with `SHOULDER_LIFT` commanded across its provisional band and the
+camera cropped to exclude a person in the room:
+
+| Command | changed px | pack |
+|---------|-----------:|------|
+| 1500 -> 1800 | 0 | 7.398 -> 7.550 V (rose) |
+| 1500 -> 1200 | 0 | 7.565 -> 7.557 V (flat) |
+| 1200 -> 1500 | 2 | 7.557 -> 7.384 V (sagged 0.17 V) |
+
+Every other joint moved strongly through the same code path in the same session
+(ELBOW 56,860 px, WRIST_FLEX 17,969, SHOULDER_PAN 13,341, WRIST_ROLL 10,770).
+
+The pack behaviour is *asymmetric*, which is new information the 07-28 report did
+not have: commanding the joint one way draws real current while nothing moves, and
+commanding it the other way draws nothing. Current drawn with no motion is a servo
+pushing against something it cannot turn — or turning a horn that is no longer
+coupled to the link. Both are family B.
+
+**Torque into this joint was stopped as soon as the asymmetry showed up.** Three
+commanded moves total. This project has already destroyed one servo by leaving
+torque in a joint that would not move.
+
+### The two-second check that settles it, before any part is ordered
+
+From the Notion runbook, and unchanged since 07-28: **command the joint and watch
+the servo's own output horn, not the arm link.**
+
+* Horn turns, link does not -> the horn screw or linkage has come adrift. Tighten
+  it. **No new servo needed** — and this now looks like the most probable outcome,
+  because a loose fastener is exactly what "works after handling, fails after
+  handling" looks like.
+* Nothing moves at the horn either -> electrical, order the LDX-218.
+
+A second check with the arm powered and the joint commanded to hold: try to
+back-drive the shoulder gently by hand. A driven joint resists; a joint whose
+linkage is adrift swings freely.
+
+---
+
+## The 2026-07-29 clear, kept for the record
+`SHOULDER_LIFT` moved. It was re-probed with `joint_probe.py`, which reads **two**
 independent signals per joint rather than the one the original report relied on:
 the project's own `VisionGuard` motion score (so the numbers are comparable with
 `camera-check`) and pack sag during the move.
@@ -33,11 +84,14 @@ attempts, flat pack. Between the two sessions the operator handled the arm. Whic
 of the two failure families below was actually at fault, and what fixed it, was
 not recorded — so the runbook below stays, unchanged, for the next time.
 
-**What this cost, and the lesson kept.** The dead-servo claim propagated into
+**What that clear cost, and the lesson kept.** The dead-servo claim propagated into
 planning documents in two repositories (`research/04-architecture.md`'s M4 gate,
 `research/07-mini-bottles.md`'s "hard, total blocker"), where it blocked work for a
-day after the hardware was already fine. A fault that gates a plan needs its status
-re-checked before the plan is, not after.
+day. Then the opposite happened: this file was marked RESOLVED on the strength of
+one good session, and the joint failed again the next day. **Neither "dead" nor
+"fixed" was ever a durable fact about this joint.** An intermittent fault needs a
+re-check at the start of every session that depends on it, which is what
+`joint_probe.py` is for.
 
 **One thing the re-probe changed in code.** The measured per-joint sag column above
 is now the evidence behind `_MEASURED_LIVE_SAG_V` in `robohand/calibrate.py`. A live
@@ -55,7 +109,6 @@ here.
 Status at the time: OPEN — requires physical inspection by the operator.
 
 ## Summary
-
 `SHOULDER_LIFT` (servo ID 5, see `robohand/config.py:58`) does not move. Every other
 joint on the arm responds normally. The fault is almost certainly a disconnected or
 failed servo, **not** a software limit and **not** a mechanical jam.
@@ -150,7 +203,7 @@ the pack; the voltage is perfectly flat).
 6. If it is still dead, swap the servo 5 lead with a known-good channel to determine
    whether the fault is in the cable/board or in the servo.
 
-## Impact (as assessed on 2026-07-28; the fault is now cleared)
+## Impact (as assessed on 2026-07-28; applies again while the fault is open)
 
 Without shoulder lift the arm loses its main vertical-reach degree of freedom. Base
 rotation, elbow, wrist flex, wrist roll and the gripper still work, so a constrained
