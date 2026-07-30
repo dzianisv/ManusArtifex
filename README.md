@@ -34,6 +34,8 @@ and the three defence rings everything else is built on.
 
 - [docs/safety.md](docs/safety.md) — safety architecture, limits, and procedures
 - [docs/calibration.md](docs/calibration.md) — vision-assisted joint calibration
+- [docs/camera-field-of-view.md](docs/camera-field-of-view.md) — **open blocker:** the camera cannot see the gripper
+- [docs/hardware-fault-servo5.md](docs/hardware-fault-servo5.md) — the servo-5 fault, and how it was cleared
 - [docs/pick.md](docs/pick.md) — vision-guided pick, and why it servos instead of solving IK
 - [docs/cocktail-robot.md](docs/cocktail-robot.md) — why no VLA can drive this arm
 - [docs/research-hardware.md](docs/research-hardware.md) — what the controller can and cannot report

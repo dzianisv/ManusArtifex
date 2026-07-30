@@ -123,7 +123,8 @@ class JointUnresponsive(CalibrationError):
 
     Subclasses ``CalibrationError`` and NOT ``ObserverError`` on purpose: this is a
     fact about a single joint's *hardware*, not about the observer's ability to see.
-    A dead joint (e.g. the real SHOULDER_LIFT / servo-5 fault: commanded across its
+    A dead joint (e.g. the 2026-07-28 SHOULDER_LIFT / servo-5 fault, since cleared:
+    commanded across its
     band it moved less than the camera noise floor while the pack stayed flat -- no
     current drawn -- see docs/hardware-fault-servo5.md) produces the exact same
     "commanded motion, saw nothing" signal a blind camera does. Distinguishing them
@@ -650,11 +651,31 @@ _BATTERY_NOISE_FLOOR_V = 0.02
 #: Nominal pack sag per unit of commanded travel, in volts.
 #:
 #: REASONED FROM THE SIMULATOR, NOT MEASURED ON THIS ARM. ``sim.py`` models sag as
-#: a linear 0.0004 V/unit. The real arm's figure is unknown and cannot be measured
-#: while it is powered down with servo 5 dead, so this is used only to decide
-#: whether a burst is *large enough to bother reasoning about* -- never to predict
-#: an expected voltage or to convict on a shortfall.
+#: a linear 0.0004 V/unit. The real arm's per-unit figure is still unknown -- the
+#: 2026-07-29 probe below measured *whole-leg* sag at one amplitude, not a slope --
+#: so this is used only to decide whether a burst is *large enough to bother
+#: reasoning about* -- never to predict an expected voltage or to convict on a
+#: shortfall.
 _BATTERY_SAG_PER_UNIT_V = 0.0004
+
+#: Largest pack sag a **live** joint produced on the real arm, per joint, volts.
+#:
+#: MEASURED, 2026-07-29, on the powered arm: ``joint_probe.py --delta 120`` (120
+#: raw units of commanded travel per leg, two legs per joint, largest sag kept).
+#: Every joint here was independently confirmed to move. See
+#: docs/hardware-fault-servo5.md.
+#:
+#: The spread is the point: 150x between the least and the most. Sag is dominated
+#: by how much gravity load the joint carries, not by how far it travels, which is
+#: why a single global slope cannot decide whether a flat pack means anything.
+_MEASURED_LIVE_SAG_V = {
+    "SHOULDER_LIFT": 0.60,  # lifts the whole arm in any pose
+    "ELBOW": 0.29,
+    "WRIST_FLEX": 0.28,
+    "WRIST_ROLL": 0.22,
+    "GRIP": 0.02,  # jaws close on air
+    "SHOULDER_PAN": 0.004,  # rotates about the vertical: gravity-neutral
+}
 
 #: How far a live joint's expected sag must clear the noise floor before a flat
 #: reading is allowed to mean anything.
@@ -679,14 +700,42 @@ _BATTERY_SAG_PER_UNIT_V = 0.0004
 _BATTERY_TRUST_MARGIN = 2.0
 
 
-def _battery_signal_is_trustworthy(commanded_travel: int) -> bool:
+#: Joints whose *live* sag was measured at or below the noise floor. For these a
+#: flat pack is not evidence of anything: a healthy one reads flat too.
+_BATTERY_BLIND_JOINTS = frozenset(
+    name
+    for name, sag in _MEASURED_LIVE_SAG_V.items()
+    if sag <= _BATTERY_NOISE_FLOOR_V
+)
+
+
+def _battery_signal_is_trustworthy(joint: str, commanded_travel: int) -> bool:
     """Would a *live* joint sag the pack measurably over a burst this size?
 
     If not, a flat reading carries no information -- a healthy joint and a dead one
     both read as flat -- and must not be used to convict. Returns False for a burst
     too small to reason about, in which case the caller falls back to the
     blind-camera diagnosis.
+
+    Two independent ways to fail the test, and a joint only has to fail one:
+
+    * **The joint never sags, however far it travels.** ``SHOULDER_PAN`` rotates
+      about the vertical axis and lifts nothing; on 2026-07-29 a live one moved
+      the camera by 4,867/42,671 motion score while sagging the pack 0.004 V --
+      a *fifth* of the 0.02 V noise floor. ``GRIP`` closes on air and sagged 0.02 V,
+      exactly at it. Before this check, any burst over 100 units was declared
+      trustworthy on travel alone, so a live-but-unseen ``SHOULDER_PAN`` (which is
+      today's situation for the whole upper arm -- see docs/camera-field-of-view.md)
+      would have been convicted as failed-open and an operator sent to replace a
+      working servo. That is the same class of error as condemning servo 5 on
+      camera evidence alone, and it is the reason this project reads two signals.
+    * **The burst is too small** for even a gravity-loaded joint to show up over
+      the noise floor.
+
+    A joint with no measurement is treated as blind: silence is not evidence.
     """
+    if joint not in _MEASURED_LIVE_SAG_V or joint in _BATTERY_BLIND_JOINTS:
+        return False
     expected_sag = commanded_travel * _BATTERY_SAG_PER_UNIT_V
     return expected_sag >= _BATTERY_NOISE_FLOOR_V * _BATTERY_TRUST_MARGIN
 
@@ -751,7 +800,7 @@ def _dead_servo_message(
         "pushing against a stop."
     )
     parts.append(
-        "This is the real SHOULDER_LIFT / servo-5 fault signature. See "
+        "This is the SHOULDER_LIFT / servo-5 fault signature of 2026-07-28. See "
         "docs/hardware-fault-servo5.md for how to tell a dead servo from a jam and "
         "what to inspect (cable seating, connector, servo swap)."
     )
@@ -778,9 +827,9 @@ def _raise_unseen_motion(
     * **The camera cannot see this joint** (occlusion, bad ROI, dead camera, bad
       angle) -> ``CalibrationAborted``, as before. The joint moved; we just could
       not watch it.
-    * **The actuator is failed-open** (disconnected servo -- the real SHOULDER_LIFT /
-      servo-5 fault) -> ``JointUnresponsive``. Nothing moved at all, and the camera
-      is fine.
+    * **The actuator is failed-open** (disconnected servo -- the 2026-07-28
+      SHOULDER_LIFT / servo-5 fault) -> ``JointUnresponsive``. Nothing moved at all,
+      and the camera is fine.
 
     The discriminator is current draw, which is free here: the burst's moves have
     already happened, so reading pack voltage either side of them adds no motion.
@@ -798,8 +847,9 @@ def _raise_unseen_motion(
     *simulation*, because ``sim`` models current as proportional to travel and does
     not model locked-rotor draw at all -- so a pinned joint reads flat there,
     identical to a dead one. That is a limitation of the simulator's battery model,
-    not of the rule; it cannot be validated either way while the arm is powered down
-    and servo 5 is dead. When voltage is unreadable the verdict falls back to the
+    not of the rule; it cannot be validated either way without deliberately
+    disconnecting a servo on the real arm. When voltage is unreadable the verdict
+    falls back to the
     unseen-motion plus no-stall evidence alone, and the message says so.
     """
     have_voltage = v_before is not None and v_after is not None
@@ -807,7 +857,7 @@ def _raise_unseen_motion(
     # A burst too small for a live joint to sag the pack measurably makes a flat
     # reading meaningless -- healthy and dead look identical -- so the battery
     # evidence is withheld entirely rather than guessed at.
-    trustworthy = _battery_signal_is_trustworthy(commanded_travel)
+    trustworthy = _battery_signal_is_trustworthy(name, commanded_travel)
     drew_current = have_voltage and trustworthy and sag > _BATTERY_NOISE_FLOOR_V
     stalled = (
         stall_before is not None
@@ -828,6 +878,18 @@ def _raise_unseen_motion(
         why = "stall time accrued"
     elif not have_voltage:
         why = "pack voltage could not be read, so it could not be cleared or convicted"
+    elif name in _BATTERY_BLIND_JOINTS:
+        why = (
+            f"a live {name} sagged only "
+            f"{_MEASURED_LIVE_SAG_V[name]:.3f} V when it was measured on 2026-07-29, "
+            f"at or under the {_BATTERY_NOISE_FLOOR_V} V noise floor, so a flat pack "
+            "on this joint is what a healthy one looks like"
+        )
+    elif name not in _MEASURED_LIVE_SAG_V:
+        why = (
+            f"no live sag has ever been measured for {name}, so a flat pack here "
+            "cannot be told from a healthy reading"
+        )
     else:
         why = (
             f"this {commanded_travel}-unit burst is too small for a live joint to sag "

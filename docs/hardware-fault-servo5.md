@@ -1,7 +1,58 @@
 # Hardware fault: servo 5 (SHOULDER_LIFT) non-responsive
 
-Status: **OPEN — requires physical inspection by the operator.**
+Status: **RESOLVED 2026-07-29 — the joint responds. No replacement is needed.**
 Found: 2026-07-28, first full hardware session after the gripper stall incident.
+Cleared: 2026-07-29, on the next live session, after the operator worked on the arm.
+
+## Resolution (2026-07-29)
+
+`SHOULDER_LIFT` moves. It was re-probed with `joint_probe.py`, which reads **two**
+independent signals per joint rather than the one the original report relied on:
+the project's own `VisionGuard` motion score (so the numbers are comparable with
+`camera-check`) and pack sag during the move.
+
+`joint_probe.py --delta 120`, both legs, camera noise floor 1,317:
+
+| Joint          | best motion score | largest pack sag | Verdict |
+|----------------|------------------:|-----------------:|---------|
+| SHOULDER_PAN   |            42,671 |          0.004 V | alive; gravity-neutral, so near-zero sag is correct |
+| **SHOULDER_LIFT** |      **134,641** |      **0.60 V** | **alive** |
+| ELBOW          |            13,105 |           0.29 V | alive, loaded |
+| WRIST_FLEX     |            93,510 |           0.28 V | alive, loaded |
+| WRIST_ROLL     |            19,400 |           0.22 V | alive; sag proves it, the camera barely sees it |
+| GRIP           |            23,412 |           0.02 V | alive; low sag correct, the jaws close on air |
+
+`SHOULDER_LIFT` scored **100x the noise floor** and loaded the pack **150x harder
+than `SHOULDER_PAN`**. A failed-open servo does neither. Both signals agree, which
+is the standard this project holds itself to after nearly condemning `WRIST_ROLL`
+on a camera reading alone (see docs/camera-field-of-view.md).
+
+**This is not a retraction of the original diagnosis.** On 2026-07-28 the joint
+really did not move: zero motion over the full 600-unit band, four consecutive
+attempts, flat pack. Between the two sessions the operator handled the arm. Which
+of the two failure families below was actually at fault, and what fixed it, was
+not recorded — so the runbook below stays, unchanged, for the next time.
+
+**What this cost, and the lesson kept.** The dead-servo claim propagated into
+planning documents in two repositories (`research/04-architecture.md`'s M4 gate,
+`research/07-mini-bottles.md`'s "hard, total blocker"), where it blocked work for a
+day after the hardware was already fine. A fault that gates a plan needs its status
+re-checked before the plan is, not after.
+
+**One thing the re-probe changed in code.** The measured per-joint sag column above
+is now the evidence behind `_MEASURED_LIVE_SAG_V` in `robohand/calibrate.py`. A live
+`SHOULDER_PAN` sags 0.004 V and a live `GRIP` 0.02 V — at or under the 0.02 V noise
+floor — so on those two joints a flat pack is what *healthy* looks like, and the
+failed-open discriminator is no longer allowed to convict them on it. Before that
+change, any burst over 100 raw units was trusted on travel alone, which would have
+diagnosed a live-but-unseen `SHOULDER_PAN` exactly the way servo 5 was diagnosed
+here.
+
+---
+
+# Original report (2026-07-28), unchanged
+
+Status at the time: OPEN — requires physical inspection by the operator.
 
 ## Summary
 
@@ -99,7 +150,7 @@ the pack; the voltage is perfectly flat).
 6. If it is still dead, swap the servo 5 lead with a known-good channel to determine
    whether the fault is in the cable/board or in the servo.
 
-## Impact
+## Impact (as assessed on 2026-07-28; the fault is now cleared)
 
 Without shoulder lift the arm loses its main vertical-reach degree of freedom. Base
 rotation, elbow, wrist flex, wrist roll and the gripper still work, so a constrained
@@ -110,3 +161,10 @@ Auto-calibration must not be run on `SHOULDER_LIFT` while this fault is open: th
 search detects a mechanical stop by observing that motion has ceased, and a joint that
 never moves at all looks exactly like a joint that is already at its stop. It would
 "find" a bogus limit immediately in both directions.
+
+That last hazard is no longer left to a document. `calibrate` now runs an
+observer-reliability burst before it will record any stop, and a joint whose motion
+is never seen raises instead of writing a band — `JointUnresponsive` when the pack
+stays flat on a joint whose live sag is known to be measurable, `CalibrationAborted`
+otherwise. Verified in the simulator against a blind observer: the run aborts and
+`robohand/data/config.json` is byte-identical afterwards.

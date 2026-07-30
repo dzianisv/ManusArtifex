@@ -120,8 +120,8 @@ class SimJoint:
         stall, and is tracked separately.
         """
         if self.dead:
-            # A completely dead servo (disconnected / failed-open -- the real
-            # SHOULDER_LIFT / servo-5 fault). The controller still energises the bus
+            # A completely dead servo (disconnected / failed-open -- the
+            # 2026-07-28 SHOULDER_LIFT / servo-5 fault, since cleared). The controller still energises the bus
             # for the commanded window because it has no feedback and cannot know
             # the servo is gone, so ``torque_on`` flips exactly as it would for a
             # live joint (torque/packet accounting is identical). But nothing turns:

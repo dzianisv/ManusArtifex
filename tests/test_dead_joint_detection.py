@@ -318,11 +318,56 @@ def test_declined_verdict_does_not_claim_the_actuator_is_alive():
 
 
 def test_trust_boundary_is_exercised_from_both_sides():
-    """The trust rule itself, at its edge."""
+    """The travel half of the trust rule, at its edge, on a joint that does sag."""
     per_unit = calibration._BATTERY_SAG_PER_UNIT_V
     needed = NOISE_FLOOR * calibration._BATTERY_TRUST_MARGIN / per_unit
-    assert calibration._battery_signal_is_trustworthy(int(needed) + 1) is True
-    assert calibration._battery_signal_is_trustworthy(int(needed) - 1) is False
+    assert calibration._battery_signal_is_trustworthy("ELBOW", int(needed) + 1) is True
+    assert calibration._battery_signal_is_trustworthy("ELBOW", int(needed) - 1) is False
+
+
+def test_a_joint_that_never_sags_is_never_trusted_however_far_it_travels():
+    """The measured half of the rule. SHOULDER_PAN rotates about the vertical and
+    lifts nothing: a live one sagged 0.004 V on 2026-07-29, a fifth of the noise
+    floor. Trusting a flat pack there convicts healthy hardware."""
+    assert "SHOULDER_PAN" in calibration._BATTERY_BLIND_JOINTS
+    assert "GRIP" in calibration._BATTERY_BLIND_JOINTS
+    for travel in (120, 600, 1600, 100_000):
+        assert calibration._battery_signal_is_trustworthy("SHOULDER_PAN", travel) is False
+        assert calibration._battery_signal_is_trustworthy("GRIP", travel) is False
+
+
+def test_an_unmeasured_joint_is_never_trusted():
+    """Silence is not evidence: a joint nobody has measured cannot be convicted."""
+    assert calibration._battery_signal_is_trustworthy("NO_SUCH_JOINT", 100_000) is False
+
+
+def test_the_blind_joint_set_is_derived_from_the_measurements_not_hardcoded():
+    """If someone measures SHOULDER_PAN properly and it does sag, the exemption must
+    disappear on its own rather than linger as a stale hardcoded name."""
+    for name, sag in calibration._MEASURED_LIVE_SAG_V.items():
+        assert (name in calibration._BATTERY_BLIND_JOINTS) is (
+            sag <= calibration._BATTERY_NOISE_FLOOR_V
+        )
+
+
+def test_a_live_but_unseen_gravity_neutral_joint_is_not_convicted():
+    """The regression this rule exists for, at the discriminator. Flat pack, no
+    stall, a burst far over the travel threshold -- the exact reading that convicted
+    ELBOW -- must acquit SHOULDER_PAN, and say why in words an operator can act on."""
+    with pytest.raises(JointUnresponsive):
+        calibration._raise_unseen_motion(
+            "ELBOW", 6, 6, calibration.CalibrationSettings(),
+            7.40, 7.40, 100.0, 100.0, TRUSTED_TRAVEL,
+        )
+    with pytest.raises(calibration.CalibrationAborted) as excinfo:
+        calibration._raise_unseen_motion(
+            "SHOULDER_PAN", 6, 6, calibration.CalibrationSettings(),
+            7.40, 7.40, 100.0, 100.0, TRUSTED_TRAVEL,
+        )
+    msg = str(excinfo.value)
+    assert not isinstance(excinfo.value, JointUnresponsive)
+    assert "could NOT be cleared or convicted" in msg
+    assert "0.004 V" in msg and "2026-07-29" in msg
 
 
 def test_shipped_default_step_keeps_the_check_armed():
@@ -331,7 +376,9 @@ def test_shipped_default_step_keeps_the_check_armed():
     settings = calibration.CalibrationSettings()
     assert settings.step == 30
     travel = settings.step * (settings.verification_moves + 2)
-    assert calibration._battery_signal_is_trustworthy(travel) is True
+    assert calibration._battery_signal_is_trustworthy("ELBOW", travel) is True
+    # ...and armed for the joint the whole fault report was about.
+    assert calibration._battery_signal_is_trustworthy("SHOULDER_LIFT", travel) is True
 
 
 @pytest.mark.parametrize("step", [15, 30, 60])
