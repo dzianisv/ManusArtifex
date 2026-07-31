@@ -87,3 +87,16 @@ Read [docs/safety.md](docs/safety.md) before commanding any motion.
 - Never leave torque in a joint that is not moving. Stop after 3 attempts.
 - Run `robohand markers` before trusting any vision result.
 - Two signals or it did not happen. Camera and battery sag. Either one alone has lied.
+
+## The sibling project
+
+`bender` is the bartender built on top of this arm: <https://github.com/dzianisv/bender>
+Same Notion space, same rules. Its own docs live in that repo.
+
+## Do not
+
+- Do not put status in DESIGN, README or any doc. Only STATUS says "currently".
+- Do not add finished work to BACKLOG. It goes in WORKLOG.
+- Do not hand-roll Notion HTTP calls. Use the MCP.
+- Do not trust one signal on hardware. Camera and battery sag, both.
+- Do not leave torque in a joint that will not move.
