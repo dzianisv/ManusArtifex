@@ -32,71 +32,21 @@ If your runtime has no MCP, add it:
 1. Read STATUS. It is the only page that says what is true now.
 2. Read GOALS.
 3. Query BACKLOG for `State = Next`. Pick work with `Owner = Agent`.
-4. Re-check any hardware fault STATUS lists as open. Do not trust it. Servo 5 flipped from dead to alive to dead across three sessions.
+4. Re-check any hardware fault STATUS lists as open. Do not trust it. Servo 5 flipped dead, alive, dead across three sessions.
 
 ## End of session
 
 Three writes. All three, every time.
 
-1. **STATUS** — delete the old blocks, write new ones. Overwrite. Never append. Update the date line.
+1. **STATUS** — delete the old blocks, write new ones. Overwrite. Never append. Update the date.
 2. **WORKLOG** — append one `## YYYY-MM-DD` heading and bullets. Never edit an old entry.
 3. **BACKLOG** — update `State` on rows you moved. Delete finished rows; their result goes in WORKLOG.
 
-## Rules
+## Everything else lives in Notion
 
-- Only STATUS says "currently". Every other page links to it instead.
-- BACKLOG holds future work only. No history.
-- WORKLOG is append-only.
-- DESIGN has no status in it.
-- One fact, one page. If you write the same fact twice, one copy will go stale.
+The rules, the writing style, the setup steps and the hardware warnings are on the
+[AGENT](https://app.notion.com/p/AGENT-how-to-use-these-pages-3aeac25eb49f81aca684e5310fea59ed)
+page. They are not repeated here. One fact, one place — that is the rule that keeps
+this space from going stale, and this file is not exempt from it.
 
-## Writing style
-
-Short sentences. Plain English. Facts and numbers. No filler words.
-
-Bad: "We conducted a comprehensive investigation which revealed that the observer was potentially unreliable."
-Good: "The camera could not see the wrist. 337 changed px against a 1,243 noise floor."
-
-## MCP tools
-
-The ones you need, by name:
-
-| Job | Tool |
-|---|---|
-| Read a page as markdown | `API-retrieve-page-markdown` |
-| Rewrite a page's content | `API-update-page-markdown` |
-| List child pages | `API-get-block-children` |
-| Append blocks | `API-patch-block-children` |
-| Edit one block | `API-update-a-block` |
-| Delete a block | `API-delete-a-block` |
-| Query the backlog | `API-query-data-source` |
-| Add a backlog row | `API-post-page` with `parent: {database_id}` |
-| New page | `API-post-page` |
-| Rename a page | `API-patch-page` |
-| Move a page | `API-move-page` with `parent: {type, page_id}` |
-
-Prefer the markdown tools for STATUS and WORKLOG. Block JSON is only needed for
-databases and single-block edits.
-
-## Hardware
-
-Read [docs/safety.md](docs/safety.md) before commanding any motion.
-
-- The servos report nothing. No position, no current. The camera is the only sensor.
-- A servo was destroyed here by one bad command. Every command is checked before it is sent.
-- Never leave torque in a joint that is not moving. Stop after 3 attempts.
-- Run `robohand markers` before trusting any vision result.
-- Two signals or it did not happen. Camera and battery sag. Either one alone has lied.
-
-## The sibling project
-
-`bender` is the bartender built on top of this arm: <https://github.com/dzianisv/bender>
-Same Notion space, same rules. Its own docs live in that repo.
-
-## Do not
-
-- Do not put status in DESIGN, README or any doc. Only STATUS says "currently".
-- Do not add finished work to BACKLOG. It goes in WORKLOG.
-- Do not hand-roll Notion HTTP calls. Use the MCP.
-- Do not trust one signal on hardware. Camera and battery sag, both.
-- Do not leave torque in a joint that will not move.
+Before commanding any motion, read [docs/safety.md](docs/safety.md).
