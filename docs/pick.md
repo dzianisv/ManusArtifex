@@ -190,30 +190,28 @@ The override is logged per move through `SafetyLayer.override_log`, the same
 path every other override in this package uses.
 
 `--locator sim` reads simulator ground truth and is refused outright on real
-hardware. `--locator classical` (HSV blob detection) and `--locator gemini`
-(Robotics-ER 1.6) need a camera.
+hardware. `--locator classical` (HSV blob detection) needs a camera and is the
+**only sanctioned locator** (Policy 2026-08-04: no Gemini/`GEMINI_API_KEY`
+anywhere in this project). `--locator gemini` (Robotics-ER 1.6) still exists in
+the code as of this writing but must not be used — see below.
 
-### About `--locator gemini`
+### About `--locator gemini` (RETIRED — Policy 2026-08-04)
 
-The model was verified against a real photo of this exact setup on 2026-07-28
-and **it hallucinated**: asked for "a graspable object on the table" in a frame
-containing none, it confidently pointed at a background box instead of returning
-`[]` ([cocktail-robot.md](cocktail-robot.md)). So its output is treated as one
-signal among others and never as authorisation:
+**Do not use.** `--locator gemini` still exists in the code as of this writing, but Gemini and
+`GEMINI_API_KEY` are retired project-wide — not as an LLM provider, not as a perception
+fallback. Use `--locator classical` (HSV blob detection against a colored band/marker, see step
+7 above) for every real-hardware pick.
 
-- the prompt explicitly demands `[]` when the target is absent;
-- the response must be a list of objects each carrying a 2-element numeric
-  `point` in `[0, 1000]`; anything else is dropped;
-- points are converted using the *actual* frame height and width, then run
-  through `point_in_workspace` — the same acceptance test every other backend's
-  output goes through, with no privileged bypass;
-- `pick.py` re-validates independently on the motion side of the boundary;
-- and a converged look-move-look-again loop is still required. One response can
-  never move the arm.
-
-The API key is read at call time from `GEMINI_API_KEY`, falling back to
-Bitwarden. It is never logged, printed, or written anywhere. No test in this
-repository needs a key or a network connection.
+Kept for historical record — this is *why* perception here is classical-CV-only, not "VLM as a
+checked hint": the model was verified against a real photo of this exact setup on 2026-07-28 and
+**it hallucinated**. Asked for "a graspable object on the table" in a frame containing none, it
+confidently pointed at a background box instead of returning `[]`
+([cocktail-robot.md](cocktail-robot.md)). At the time, the mitigation was to treat its output as
+one signal among others and never as authorisation (explicit `[]`-when-absent prompting,
+`point_in_workspace` re-validation with no privileged bypass, independent re-validation in
+`pick.py`, a required converged look-move-look-again loop). A model that invents objects when
+asked to say "none" cannot be trusted even as a secondary signal, which is the reasoning behind
+retiring it rather than continuing to gate it.
 
 ---
 

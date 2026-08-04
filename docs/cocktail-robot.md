@@ -7,12 +7,19 @@ position feedback) + one USB webcam + MacBook (no NVIDIA GPU).
 
 | Question | Answer |
 |---|---|
-| Can I use Gemini Robotics? | **Partly.** The action-output VLA is trusted-tester only. `gemini-robotics-er-1.6-preview` (perception/reasoning) **is** on our API key and **verified working** — see below. |
+| Can I use Gemini Robotics? | **No — retired, Policy 2026-08-04.** The action-output VLA was always trusted-tester-only and unusable regardless. The perception tier (`gemini-robotics-er-1.6-preview`) was verified working on 2026-07-28 (kept below as historical record) but Gemini/`GEMINI_API_KEY` is now retired project-wide — not as LLM provider, not as a perception fallback. Perception is classical CV only — see `docs/pick.md` (`ClassicalLocator`, colored band/marker). |
 | Can any VLA drive this arm? | **No.** Every VLA surveyed requires readable joint state. This arm has none, by construction. |
 | Can the arm pour from a bottle? | **No.** A full 750 ml bottle (~1.2 kg) is ~5–8× the estimated safe payload. |
 | So what do we build? | LLM plans → classical scripted controller executes (the *Code-as-Policies* pattern). Bottles fixed + pumps. Arm moves the **glass** only. |
 
-## 1. Gemini Robotics: what we can and cannot use
+## 1. Gemini Robotics: what we could and could not use (RETIRED — historical record only)
+
+> **Policy 2026-08-04: Gemini retired project-wide.** No `GEMINI_API_KEY` anywhere — not as LLM
+> provider, not as a perception fallback. Perception is classical CV only (colored band/marker
+> on the bottle, see `docs/pick.md`'s `ClassicalLocator`). Everything in this section describes
+> what was tested on 2026-07-28, before this policy; it is preserved for the record, not as
+> instructions to follow. Do not fetch `GEMINI_API_KEY` from Bitwarden, do not re-run the
+> commands below, and do not add Gemini back into any locator or planner.
 
 | Tier | Access | Output | Us |
 |---|---|---|---|
@@ -27,18 +34,13 @@ Source: <https://ai.google.dev/gemini-api/docs/robotics-overview>,
 Google's own docs say to combine it with "a low-level controller" you supply. That is exactly
 what `robohand` already is.
 
-### Verified on our hardware, 2026-07-28
+### Verified on our hardware, 2026-07-28 (historical — do not repeat)
 
-Key: Bitwarden item `GEMINI_API_KEY` (value is in the item **notes**, not the password field).
-The stale key in `~/.env.d/google_genai.env` is **invalid** — do not use it.
-
-```bash
-source ~/.env.d/bitwarden.env
-K=$(bw get notes GEMINI_API_KEY | tr -d '\n' | grep -oE 'AIza[A-Za-z0-9_-]{20,}' | head -1)
-curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$K&pageSize=500" \
-  | python3 -c "import sys,json;print([m['name'] for m in json.load(sys.stdin)['models'] if 'robot' in m['name']])"
-# -> ['models/gemini-robotics-er-1.5-preview', 'models/gemini-robotics-er-1.6-preview']
-```
+Access was confirmed by fetching a Google AI Studio key from a now-decommissioned Bitwarden item
+(`GEMINI_API_KEY`) and calling the models-list endpoint, which confirmed
+`gemini-robotics-er-1.5-preview` and `gemini-robotics-er-1.6-preview` were available on that key.
+That key and that Bitwarden item are not to be used going forward — Policy 2026-08-04 retires
+Gemini project-wide, so this step has no current equivalent and should not be repeated.
 
 Pointing test against `docs/media/snapshot.jpg` (real photo of our arm), 1153 prompt tokens:
 
@@ -81,7 +83,7 @@ faking ground truth, which poisons everything downstream.
 
 | Model | Open | Runs on our Mac | Needs joint state | Verdict |
 |---|---|---|---|---|
-| Gemini Robotics-ER 1.6 | ✅ API | ✅ cloud | no | ✅ use as planner |
+| Gemini Robotics-ER 1.6 | ✅ API | ✅ cloud | no | ~~✅ use as planner~~ **retired, Policy 2026-08-04 — no Gemini/`GEMINI_API_KEY`** |
 | Gemini Robotics (VLA / on-device) | ❌ | – | yes | ❌ |
 | OpenVLA (7B) | ✅ | ❌ CUDA + flash-attn, no aarch64 wheels | **no** — image+prompt only | ❌ *see below* |
 | Octo | ✅ | ❌ GPU/TPU | yes | ❌ |
@@ -121,7 +123,9 @@ Both ends of the market avoid "small arm lifts full bottle". So do we.
 
 ```
    ┌─────────────────────────────────────────────┐
-   │  Gemini ER 1.6 / any VLM   (~1 call/step)   │  semantic: which bottle, where's the glass
+   │  Classical CV: colored band/marker per       │  semantic: which bottle, where's the glass
+   │  bottle — no VLM/LLM in the perception path  │  (Policy 2026-08-04: no Gemini/GEMINI_API_KEY
+   │  (Policy 2026-08-04)                         │  anywhere; see docs/pick.md ClassicalLocator)
    └───────────────┬─────────────────────────────┘
                    │ 2D points (0-1000)
    ┌───────────────▼─────────────────────────────┐
@@ -152,8 +156,9 @@ Key decisions:
 4. **Look-move-look-again visual servoing** for the last few cm. The camera closes the loop the
    servos can't. Works with a bad kinematic model; needs no encoders. This is the single most
    important technique for this hardware.
-5. **Volume**: timed pour (primary) + HX711 load cell under the glass (closed loop). VLM
-   liquid-level estimate as a *sanity check only*, never as control.
+5. **Volume**: timed pour (primary) + HX711 load cell under the glass (closed loop). No
+   VLM/LLM liquid-level estimate of any kind (Policy 2026-08-04: perception is classical CV
+   only) — the load cell is the only secondary source of truth.
 
 ## 5. Phased plan
 
@@ -251,8 +256,10 @@ even in the good case the Jetson is optional.
 
 1. Buy the SO-101 follower kit. It is the cheapest line item here and the only one that removes
    the actual blocker.
-2. Keep the LeArm on the Gemini-ER + scripted-controller path. It matches what an open-loop arm
-   can actually do, and "pick up an object" needs no 30 Hz loop. Safety layer and sim carry over.
+2. Keep the LeArm on the classical-CV + scripted-controller path (Policy 2026-08-04: no
+   Gemini/VLM in the perception path — this superseded the earlier "Gemini-ER" framing). It
+   matches what an open-loop arm can actually do, and "pick up an object" needs no 30 Hz loop.
+   Safety layer and sim carry over.
 3. On arrival: calibrate, teleoperate **~50 episodes** (5 object positions × 10 — HF explicitly
    reports 25 episodes *failing*), push the dataset.
 4. Fine-tune `lerobot/smolvla_base`; run rollouts from the MacBook.

@@ -37,7 +37,7 @@ No threshold separates "the arm moved" from "a human moved" when the measurement
 
 **Fiducial markers.** A printed pattern with a known ID. The detector looks for that pattern only. Ships in OpenCV as `cv2.aruco`. This is the standard substitute when there are no encoders. **Chosen.**
 
-**A VLM.** Good at meaning. Bad at geometry. Tested on this arm 2026-07-28: Gemini Robotics-ER 1.6 missed the gripper by 20–30 px and reported a graspable object in a frame that had none. Google's own guidance is to pair ER with a low-level controller you supply.
+**A VLM.** Good at meaning. Bad at geometry. Tested on this arm 2026-07-28: Gemini Robotics-ER 1.6 missed the gripper by 20–30 px and reported a graspable object in a frame that had none. Google's own guidance is to pair ER with a low-level controller you supply. (Not chosen — see below. Policy 2026-08-04: Gemini/`GEMINI_API_KEY` is retired project-wide regardless; perception is classical CV only.)
 
 ## Design
 
