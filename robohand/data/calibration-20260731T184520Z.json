@@ -1,0 +1,43 @@
+{
+  "schema": "robohand-calibration-v2",
+  "generated_utc": "2026-07-31T18:45:20Z",
+  "transport": "hardware",
+  "observer": "VisionMotionObserver(roi=(0, 0, 640, 720), min_changed_pixels=1300)",
+  "elapsed_s": 29.196,
+  "torque_ms": 7600,
+  "stall_ms": null,
+  "settings": {
+    "step": 60,
+    "step_duration_ms": 400,
+    "margin": 60,
+    "confirmations": 2,
+    "verification_moves": 6,
+    "max_verification_misses": 1,
+    "max_steps_per_direction": 64,
+    "max_torque_ms": 120960,
+    "max_stall_ms": 14400,
+    "max_wall_clock_s": 576.0,
+    "max_ambiguous_observations": 16
+  },
+  "joints": {
+    "GRIP": {
+      "joint": "GRIP",
+      "servo_id": 1,
+      "min": 1560,
+      "max": 2240,
+      "margin": 60,
+      "min_finding": "bounded_by_policy_limit",
+      "max_finding": "bounded_by_policy_limit",
+      "steps_min": 8,
+      "steps_max": 6,
+      "ambiguous_observations": 0,
+      "torque_ms": 7600,
+      "stall_ms": null,
+      "search_bounds": [
+        1500,
+        2300
+      ]
+    }
+  },
+  "failed_joints": {}
+}

@@ -11,35 +11,39 @@
   "servos": {
     "GRIP": {
       "id": 1,
-      "min": 1600,
-      "max": 2300,
+      "min": 1560,
+      "max": 2240,
       "center": 1950,
-      "comment": "LeArm gripper valid range is 1500..2500 -- NOT 500..2500. Reference lib: `case LeArm: if(servo==1) return clamp(value,1500,2500)`. Lower raw = MORE OPEN; 1500 is the open mechanical stop. Commanding 700 drove past it and splayed the jaws = the 2026-07-28 stall. Band keeps 100 clear of 1500 and 200 clear of 2500.",
-      "calibrated": false
+      "comment": "Auto-calibrated from calibration-20260731T184520Z.json (min: bounded_by_policy_limit, max: bounded_by_policy_limit, margin 60 raw units per end, observed via VisionMotionObserver(roi=(0, 0, 640, 720), min_changed_pixels=1300)). Vision-derived, open loop, not a hand-measured value -- cross-check by hand before trusting it with a payload.",
+      "calibrated": true,
+      "calibration_source": "calibration-20260731T184520Z.json"
     },
     "WRIST_ROLL": {
       "id": 2,
-      "min": 1200,
-      "max": 1800,
+      "min": 760,
+      "max": 2240,
       "center": 1500,
-      "calibrated": false,
-      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off."
+      "calibrated": true,
+      "comment": "Auto-calibrated from calibration-20260731T175504Z.json (min: bounded_by_policy_limit, max: bounded_by_policy_limit, margin 60 raw units per end, observed via VisionMotionObserver(roi=(0, 0, 640, 720), min_changed_pixels=1300)). Vision-derived, open loop, not a hand-measured value -- cross-check by hand before trusting it with a payload.",
+      "calibration_source": "calibration-20260731T175504Z.json"
     },
     "WRIST_FLEX": {
       "id": 3,
-      "min": 1200,
-      "max": 1800,
+      "min": 760,
+      "max": 2240,
       "center": 1500,
-      "calibrated": false,
-      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off."
+      "calibrated": true,
+      "comment": "Auto-calibrated from calibration-20260731T181642Z.json (min: bounded_by_policy_limit, max: bounded_by_policy_limit, margin 60 raw units per end, observed via VisionMotionObserver(roi=(0, 0, 640, 720), min_changed_pixels=1300)). Vision-derived, open loop, not a hand-measured value -- cross-check by hand before trusting it with a payload.",
+      "calibration_source": "calibration-20260731T181642Z.json"
     },
     "ELBOW": {
       "id": 4,
-      "min": 1200,
-      "max": 1800,
+      "min": 760,
+      "max": 2240,
       "center": 1500,
-      "calibrated": false,
-      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off."
+      "calibrated": true,
+      "comment": "Auto-calibrated from calibration-20260731T180822Z.json (min: bounded_by_policy_limit, max: bounded_by_policy_limit, margin 60 raw units per end, observed via VisionMotionObserver(roi=(0, 0, 640, 720), min_changed_pixels=1300)). Vision-derived, open loop, not a hand-measured value -- cross-check by hand before trusting it with a payload.",
+      "calibration_source": "calibration-20260731T180822Z.json"
     },
     "SHOULDER_LIFT": {
       "id": 5,
@@ -51,11 +55,12 @@
     },
     "SHOULDER_PAN": {
       "id": 6,
-      "min": 1200,
-      "max": 1800,
+      "min": 1500,
+      "max": 2240,
       "center": 1500,
-      "calibrated": false,
-      "comment": "PROVISIONAL conservative band (center +/-300). NOT calibrated. Widen only after hand-teaching the real mechanical limits with torque off."
+      "calibrated": true,
+      "comment": "Auto-calibrated from calibration-20260731T182210Z.json (min: bounded_by_mechanical_stop, max: bounded_by_policy_limit, margin 60 raw units per end, observed via VisionMotionObserver(roi=(0, 0, 640, 720), min_changed_pixels=1300)). Vision-derived, open loop, not a hand-measured value -- cross-check by hand before trusting it with a payload.",
+      "calibration_source": "calibration-20260731T182210Z.json"
     }
   },
   "motion": {
@@ -76,17 +81,22 @@
     "gripper_note": "NEVER command servo 1 (GRIP) below 1500 under any circumstance -- this is documentation only. The real enforcement is the hardcoded ELECTRICAL_LIMITS[1] floor in robohand/config.py, which cannot be widened by editing this file. robohand.config raises at import time if this value and the hardcoded one disagree."
   },
   "vision": {
-    "roi": [0, 0, 1.0, 1.0],
-    "roi_comment": "Fractional [x, y, w, h] = [0,0,1.0,1.0] = the WHOLE 1280x720 frame, no cropping (guard._resolve_roi treats values in (0,1] as frame fractions, so this maps to x=0,y=0,w=1280,h=720). The camera mount was improved and now frames the ENTIRE arm -- base, all links, and the gripper -- well lit; full-frame raw-absdiff is now sufficient on its own (no-motion noise 454/577 changed px vs SHOULDER_PAN 78,116 = 135x, GRIP 25,746 = 45x; see docs/verification-camera.md 'Full-arm-in-frame measurement'). A narrower ROI (e.g. one excluding room background) remains available via `robohand camera-check --roi X Y W H` and would further widen the GRIP margin, but is NOT required for correct operation and is NOT the shipped default -- the full-frame numbers already comfortably clear the gate. If the camera or arm mount is ever moved again, re-measure the ROI and thresholds with `robohand camera-check`. Values >1 are absolute pixels; values in (0,1] are fractions of the frame. The obsolete narrow dark-corner-only ROI was [0,300,520,420].",
+    "roi": [
+      0,
+      0,
+      640,
+      720
+    ],
+    "roi_comment": "Pixel [x, y, w, h] = left half of the 1280x720 frame, full height (values >1 are absolute pixels; values in (0,1] are fractions). Re-measured 2026-07-31: the scene now contains a small always-on LCD display on the TV stand (x~800-1120, y~240-390) whose refresh flicker alone contributed a per-tile no-motion p95 of 10,368+3,584+1,283 changed px, a dark TV (x>=750) that reflects room motion, and a lamp top-centre that triggers episodic auto-exposure hunting -- full-frame no-motion p95 measured 14,477-16,187 changed px (camera-check FAIL, headroom 0.2x). This ROI keeps the entire arm, its full vertical extent, the gripper's roll-sweep cone (staged pose, ELBOW tipped), and the table workspace, and excludes the LCD/TV/right side. Measured with `camera-check --roi 0 0 640 720` (15x0.8s): no-motion p95=415, max=423 -> PASS, headroom 7.2x at the old 3000 threshold; the variant [0,110,640,610] additionally excluding the lamp strip measured p95=373-387 over 15- and 30-frame windows but clips the gripper's jaws-up roll orientations, so the full-height crop is shipped. The previous full-frame ROI comment's numbers (noise 454/577, SHOULDER_PAN 78,116, GRIP 25,746) predate the LCD appearing in-scene. If the camera, arm mount, or the ROOM CONTENTS (lamp/TV/LCD) change again, re-measure with `robohand camera-check`. The obsolete full-frame ROI was [0,0,1.0,1.0]; the obsolete narrow dark-corner-only ROI was [0,300,520,420].",
     "diff_threshold": 25,
-    "min_changed_pixels": 3000,
-    "min_changed_pixels_comment": "Site-specific for THIS arm+camera in the NEW full-arm-in-frame setup. 3000 sits ~5.2x above the worst observed no-motion sample (577 changed px, full-frame raw absdiff, 20-warmup/8-flush protocol matching camera.py) and ~8.6x below the worst-case real motion signal (GRIP, 25,746 changed px -- the joint with the smallest visual signature and the one damaged in the original incident). It sits close to the geometric mean of the two (sqrt(577*25746) ~= 3,854), comfortably separated from both noise and the weakest real signal on a log scale. diff_threshold=25 matches the operator's absdiff>25 protocol. robohand/config.py's generic fallback stays at 150 for OTHER unmeasured deployments -- only this live config carries the measured value.",
+    "min_changed_pixels": 1300,
+    "min_changed_pixels_comment": "Site-specific for THIS arm+camera with the 2026-07-31 left-half ROI [0,0,640,720], re-derived by the same procedure as the previous full-frame value (geometric mean of worst no-motion noise and weakest measured real signal, camera-check protocol, 20-warmup/8-flush capture): worst observed in-ROI no-motion p95 = 415 changed px (max 423); weakest measured real motion = a 30-raw-unit WRIST_ROLL step (the calibrator's probe increment) with the gripper staged in frame = 4,148 changed px (4,165 via the full-height crop; the same step with the gripper OUT of frame scored only 2,161 -- stage the gripper into frame before calibrating wrist joints). sqrt(415*4148) ~= 1,312 -> 1300. Checks: 1300 >= 1.5x415=623 gate requirement (2.1x the requirement; headroom 1300/415 = 3.1x); measured separation of the real move vs noise = 4,148/415 = 10.0x (>= the 3.0 health_separation floor); signal/threshold = 3.2x. The previous value 3000 was derived for the full-frame ROI (noise 577 vs GRIP 25,746) and left the WRIST_ROLL calibration step only 1.38x above threshold under this crop -- too tight to trust 'no motion' inference. diff_threshold=25 unchanged. robohand/config.py's generic fallback stays at 150 for OTHER unmeasured deployments -- only this live config carries the measured value.",
     "blur_ksize": 5,
     "health_frames": 15,
     "health_interval_s": 0.8,
     "health_margin": 1.5,
     "health_separation": 3.0,
-    "health_comment": "Camera-health gate (robohand/camera_health.py). health_interval_s (0.8) and health_frames (15) validated in a prior round (spans more of any auto-exposure hunting cycle; surfaces a higher, more honest noise floor). health_margin (1.5): required = 1.5 * 577 ~= 865.5, comfortably below the 3000 threshold (a further ~3.5x buffer beyond the bare minimum) -- so the default config PASSES comfortably in the new good setup while still rejecting a genuine exposure-hunting/dark-scene regression (any noise floor above ~3000/1.5 ~= 2000 makes required exceed 3000 -> FAIL). health_separation (3.0): floor = 3 * 577 ~= 1731; GRIP's real motion (25,746) clears it by ~14.9x, so the visibility check also passes comfortably. See docs/verification-camera.md 'Full-arm-in-frame measurement'."
+    "health_comment": "Camera-health gate (robohand/camera_health.py). health_interval_s (0.8) and health_frames (15) validated in a prior round (spans more of any auto-exposure hunting cycle; surfaces a higher, more honest noise floor). Re-measured 2026-07-31 for the left-half ROI + 1300 threshold: health_margin (1.5): required = 1.5 * 415 ~= 623, comfortably below the 1300 threshold (2.1x the requirement) -- the config PASSES in the current scene while still rejecting a regression (any in-ROI noise floor above 1300/1.5 ~= 867 makes required exceed 1300 -> FAIL; the flickering LCD alone measured >15,000 full-frame, so un-cropping instantly fails again, as it should). health_separation (3.0): floor = 3 * 415 ~= 1245; the weakest measured real move (WRIST_ROLL 30-unit step, gripper staged in frame, 4,148 changed px) clears it by ~3.3x and clears the live-scene noise by 10x. See docs/verification-camera.md."
   },
   "gripper": {
     "step": 40,

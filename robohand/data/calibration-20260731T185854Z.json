@@ -1,0 +1,26 @@
+{
+  "schema": "robohand-calibration-v2",
+  "generated_utc": "2026-07-31T18:58:54Z",
+  "transport": "hardware",
+  "observer": "VisionMotionObserver(roi=(0, 0, 640, 720), min_changed_pixels=1300)",
+  "elapsed_s": 18.886,
+  "torque_ms": 3200,
+  "stall_ms": null,
+  "settings": {
+    "step": 60,
+    "step_duration_ms": 400,
+    "margin": 60,
+    "confirmations": 2,
+    "verification_moves": 6,
+    "max_verification_misses": 1,
+    "max_steps_per_direction": 64,
+    "max_torque_ms": 120960,
+    "max_stall_ms": 14400,
+    "max_wall_clock_s": 576.0,
+    "max_ambiguous_observations": 16
+  },
+  "joints": {},
+  "failed_joints": {
+    "SHOULDER_LIFT": "SHOULDER_LIFT: unresponsive (actuator appears failed-open). The observer saw none of 6 of 6 reliability-burst moves -- an oscillation between two positions this joint had already been watched to reach, so those moves were known-real and should have been plainly visible. Across the whole burst the pack stayed flat (7.30V -> 7.56V, delta -0.259V, within the 0.02V measurement noise floor) and the transport reported no stall time. No motion, no current drawn and nothing pushed against: that is the signature of a disconnected / failed-open servo, not of a camera that cannot see. A jammed-but-live servo would have drawn locked-rotor current and sagged the pack, or accrued stall time pushing against a stop. This is the SHOULDER_LIFT / servo-5 fault signature of 2026-07-28. See docs/hardware-fault-servo5.md for how to tell a dead servo from a jam and what to inspect (cable seating, connector, servo swap)."
+  }
+}
